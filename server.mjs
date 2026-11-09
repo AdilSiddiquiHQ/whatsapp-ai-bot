@@ -357,8 +357,13 @@ async function initWhatsApp() {
             browser: Browsers.macOS('Desktop'), // High-trust official desktop signature
             syncFullHistory: false,             // Prevent history replay overload
             shouldSyncHistoryMessage: () => false,
-            keepAliveIntervalMs: 25000,          // NAT keep-alive
-            connectTimeoutMs: 30000
+            markOnlineOnConnect: false,         // STEALTH: Never broadcast 24/7 online presence (defeats bot heuristics)
+            keepAliveIntervalMs: 30000,         // Standard 30s heartbeat
+            connectTimeoutMs: 30000,
+            appStateMacVerification: {
+                patch: false,
+                snapshot: false
+            }
         });
 
         sock.ev.on('creds.update', saveCreds);
