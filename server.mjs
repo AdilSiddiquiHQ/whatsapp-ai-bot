@@ -19,11 +19,13 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || 
     'You are a helpful, professional, and friendly WhatsApp AI assistant. Answer concisely with clean WhatsApp formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags.';
 
-// Active Groq models fallback chain
+// Active Groq models fallback chain (Updated for GroqCloud 2026 self-serve availability)
 const GROQ_MODELS = [
-    'llama-3.1-8b-instant',      // Fastest, 100% active, reliable on all tiers
-    'llama-3.3-70b-versatile',   // High intelligence (used if account has access)
-    'openai/gpt-oss-20b'         // Backup fallback
+    'openai/gpt-oss-20b',        // Blazing 1000 tokens/sec, self-serve free tier active
+    'openai/gpt-oss-120b',       // Flagship 120B model (500 tokens/sec)
+    'qwen/qwen3.8-27b',          // High reasoning (450 tokens/sec)
+    'llama-3.1-8b-instant',      // Fallbacks
+    'llama-3.3-70b-versatile'
 ];
 
 let currentQR = null;
@@ -82,52 +84,13 @@ class HumanTypingSimulator {
         return HumanMath.clamp(readingTime + formulationTime + motorPrep, 1200, 4500);
     }
 
-    // 3. Realistic typing duration calculation based on mobile 36.5 WPM baseline
-    static calculateTypingPlan(replyText) {
-        const targetWpm = HumanMath.clamp(HumanMath.normal(36.5, 4), 28, 45);
-        const baseIki = (60000 / (targetWpm * 5)); // ms per character (~330ms)
-
-        const words = (replyText || '').split(/\s+/);
-        const actions = [];
-        let currentComposing = 0;
-        let wordCounter = 0;
-        const wordsUntilPause = Math.round(HumanMath.normal(8, 2));
-
-        for (let w = 0; w < words.length; w++) {
-            const word = words[w];
-            wordCounter++;
-
-            for (let i = 0; i < word.length; i++) {
-                const char = word[i];
-                let multiplier = 1.0;
-                if (/[.,?!:;"']/.test(char)) {
-                    multiplier = HumanMath.normal(2.0, 0.3); // Punctuation takes longer
-                } else if (/[A-Z0-9]/.test(char)) {
-                    multiplier = HumanMath.normal(1.4, 0.2); // Shift / uppercase takes longer
-                } else {
-                    multiplier = HumanMath.logNormal(1.0, 0.2);
-                }
-                currentComposing += baseIki * multiplier;
-            }
-
-            // Spacebar pause
-            currentComposing += baseIki * HumanMath.normal(1.3, 0.2);
-
-            // Natural cognitive micro-pause every 7-10 words on long text
-            if (wordCounter >= wordsUntilPause && w < words.length - 1) {
-                actions.push({ type: 'composing', duration: Math.round(currentComposing) });
-                currentComposing = 0;
-                const pauseDuration = HumanMath.clamp(HumanMath.logNormal(1600, 0.3), 1000, 2500);
-                actions.push({ type: 'paused', duration: Math.round(pauseDuration) });
-                wordCounter = 0;
-            }
-        }
-
-        if (currentComposing > 0) {
-            actions.push({ type: 'composing', duration: Math.round(currentComposing) });
-        }
-
-        return actions;
+    // 3. Realistic typing duration: snappy & human (1.5s - 3.5s max, never minutes!)
+    static getTypingDuration(replyText) {
+        const chars = (replyText || '').length;
+        // Natural mobile pacing: ~15ms per character, clamped strictly between 1.2s and 3.5s
+        const duration = chars * 15;
+        const jitter = HumanMath.normal(200, 100);
+        return HumanMath.clamp(duration + jitter, 1200, 3500);
     }
 }
 
@@ -135,8 +98,8 @@ class HumanTypingSimulator {
 // 2. INBOUND DEBOUNCER & SINGLE-CONCURRENCY QUEUE
 // =============================================================
 class WhatsAppDebouncer {
-    constructor(idleTimeoutMs = 3500, maxWaitMs = 12000) {
-        this.idleTimeoutMs = idleTimeoutMs;
+    constructor(idleTimeoutMs = 1500, maxWaitMs = 6000) {
+        this.idleTimeoutMs = idleTimeoutMs; // Snappy 1.5s debounce buffer
         this.maxWaitMs = maxWaitMs;
         this.buffers = new Map();
         this.handler = null;
@@ -146,12 +109,12 @@ class WhatsAppDebouncer {
         this.handler = handler;
     }
 
-    enqueue(jid, messageKey, text) {
+    enqueue(jid, msg, text) {
         let entry = this.buffers.get(jid);
         if (!entry) {
             entry = {
                 texts: [],
-                keys: [],
+                messages: [],
                 idleTimer: null,
                 maxWaitTimer: null
             };
@@ -164,7 +127,7 @@ class WhatsAppDebouncer {
         }
 
         entry.texts.push(text);
-        entry.keys.push(messageKey);
+        entry.messages.push(msg);
 
         if (entry.idleTimer) clearTimeout(entry.idleTimer);
         entry.idleTimer = setTimeout(() => {
@@ -183,12 +146,12 @@ class WhatsAppDebouncer {
         if (entry.maxWaitTimer) clearTimeout(entry.maxWaitTimer);
 
         const mergedText = entry.texts.join('\n');
-        const lastKey = entry.keys[entry.keys.length - 1];
-        const allKeys = [...entry.keys];
+        const lastMsg = entry.messages[entry.messages.length - 1];
+        const allKeys = entry.messages.map(m => m.key).filter(Boolean);
         this.cleanup(jid);
 
         if (this.handler) {
-            this.handler(jid, mergedText, lastKey, allKeys);
+            this.handler(jid, mergedText, lastMsg, allKeys);
         }
     }
 
@@ -452,7 +415,7 @@ async function initWhatsApp() {
                 if (!text) continue;
 
                 // Pass into sliding debouncer
-                debouncer.enqueue(jid, msg.key, text);
+                debouncer.enqueue(jid, msg, text);
             }
         });
 
@@ -462,46 +425,47 @@ async function initWhatsApp() {
 }
 
 // Handle debounced message batches
-debouncer.onBatch((jid, mergedText, lastKey, allKeys) => {
+debouncer.onBatch((jid, mergedText, lastMsg, allKeys) => {
     // Add to strict Single-Concurrency Queue per JID
     jidQueue.add(jid, async () => {
         if (!sock || !isConnected) return;
 
         try {
-            // 1. Dwell delay before Blue Tick (read receipt)
+            // 1. Dwell delay before Blue Tick (read receipt) - snappy ~800ms
             const readDwell = HumanTypingSimulator.getReadDwellTime();
             await HumanMath.sleep(readDwell);
 
             // Mark incoming messages as read
             try {
-                await sock.readMessages(allKeys);
+                if (allKeys.length > 0) {
+                    await sock.readMessages(allKeys);
+                }
             } catch {}
 
-            // 2. Thinking Delay (reading time + decision formulation)
+            // 2. Thinking Delay (reading time + decision formulation) - snappy ~1s
             const thinkingDelay = HumanTypingSimulator.getThinkingDelay(mergedText);
             await HumanMath.sleep(thinkingDelay);
 
-            // 3. Generate AI response (using multi-model fallback)
+            // 3. Generate AI response (using multi-model fallback: openai/gpt-oss-20b first)
             const replyText = await callLLMWithFallback(jid, mergedText);
 
-            // 4. Execute Human Typing Cadence (composing -> paused -> composing)
-            const typingActions = HumanTypingSimulator.calculateTypingPlan(replyText);
-            for (const action of typingActions) {
-                try {
-                    await sock.sendPresenceUpdate(action.type, jid);
-                } catch {}
-                await HumanMath.sleep(action.duration);
-            }
+            // 4. Snappy Human Typing Presence (1.2s - 2.8s max, never minutes!)
+            const typingDuration = HumanTypingSimulator.getTypingDuration(replyText);
+            try {
+                await sock.sendPresenceUpdate('composing', jid);
+            } catch {}
+            await HumanMath.sleep(typingDuration);
 
-            // 5. Pre-send review dwell (user looks at drafted text before hitting send)
-            const preSendReview = HumanMath.clamp(HumanMath.logNormal(400, 0.25), 250, 700);
-            await HumanMath.sleep(preSendReview);
+            try {
+                await sock.sendPresenceUpdate('paused', jid);
+            } catch {}
 
-            // 6. Send the message
-            await sock.sendMessage(jid, { text: replyText }, { quoted: { key: lastKey } });
+            // 5. Pre-send review dwell (brief 250ms pause)
+            await HumanMath.sleep(250);
 
-            // 7. Clear presence
-            await sock.sendPresenceUpdate('paused', jid);
+            // 6. Send the message safely (no undefined crash!)
+            const quoteOption = (lastMsg && lastMsg.message) ? { quoted: lastMsg } : {};
+            await sock.sendMessage(jid, { text: replyText }, quoteOption);
 
         } catch (err) {
             console.error(`Error processing batch for ${jid}:`, err.message);
