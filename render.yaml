@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: whatsapp-ai-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SYSTEM_PROMPT
+        value: "You are a smart, professional, and friendly AI assistant on WhatsApp. Answer concisely and clearly with natural formatting and emojis."
