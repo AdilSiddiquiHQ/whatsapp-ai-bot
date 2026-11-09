@@ -19,13 +19,11 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || 
     'You are a helpful, professional, and friendly WhatsApp AI assistant. Answer concisely with clean WhatsApp formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags.';
 
-// Active Groq models fallback chain (Updated for GroqCloud 2026 self-serve availability)
+// Active Groq models fallback chain: Flagship 120B first for maximum intelligence
 const GROQ_MODELS = [
-    'openai/gpt-oss-20b',        // Blazing 1000 tokens/sec, self-serve free tier active
-    'openai/gpt-oss-120b',       // Flagship 120B model (500 tokens/sec)
-    'qwen/qwen3.8-27b',          // High reasoning (450 tokens/sec)
-    'llama-3.1-8b-instant',      // Fallbacks
-    'llama-3.3-70b-versatile'
+    'openai/gpt-oss-120b',       // Flagship 120B model (GPT-4 class intelligence, ~500 tokens/sec)
+    'openai/gpt-oss-20b',        // High-speed fallback (1000 tokens/sec)
+    'qwen/qwen3.8-27b'           // High reasoning multilingual fallback
 ];
 
 let currentQR = null;
