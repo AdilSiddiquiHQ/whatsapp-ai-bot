@@ -45,6 +45,98 @@ import {
 } from './ai-engine.mjs';
 import { waManager, normalizeDigits, formatPhoneDisplay } from './whatsapp-manager.mjs';
 
+async function sanitizeAndCompileBrain(rawPayload, existingTenant, mode = 'replace') {
+    const incoming = rawPayload?.botConfig && typeof rawPayload.botConfig === 'object'
+        ? rawPayload.botConfig
+        : (rawPayload || {});
+    const prevCfg = existingTenant?.botConfig || {};
+
+    const rawOffers = Array.isArray(incoming.offers) ? incoming.offers : (mode === 'merge' ? [] : prevCfg.offers || []);
+    const rawProducts = Array.isArray(incoming.products)
+        ? incoming.products
+        : Array.isArray(incoming.services)
+            ? incoming.services
+            : (mode === 'merge' ? [] : prevCfg.products || []);
+    const rawFaqs = Array.isArray(incoming.faqs) ? incoming.faqs : (mode === 'merge' ? [] : prevCfg.faqs || []);
+    const rawRules = Array.isArray(incoming.customRules)
+        ? incoming.customRules
+        : Array.isArray(incoming.rules)
+            ? incoming.rules
+            : (mode === 'merge' ? [] : prevCfg.customRules || []);
+    const rawQr = Array.isArray(rawPayload?.quickReplies)
+        ? rawPayload.quickReplies
+        : Array.isArray(incoming.quickReplies)
+            ? incoming.quickReplies
+            : Array.isArray(incoming.quick_replies)
+                ? incoming.quick_replies
+                : null;
+
+    const normOffers = (arr) => arr.map((o) => ({
+        title: String(o?.title || '').trim().slice(0, 60),
+        deal: String(o?.deal || '').trim().slice(0, 100),
+        code: String(o?.code || '').trim().slice(0, 32),
+        active: o?.active !== false
+    })).filter((o) => o.title && o.deal);
+
+    const normProducts = (arr) => arr.map((p) => ({
+        name: String(p?.name || '').trim().slice(0, 70),
+        price: String(p?.price ?? '').trim().slice(0, 35),
+        note: String(p?.note || '').trim().slice(0, 120),
+        active: p?.active !== false
+    })).filter((p) => p.name);
+
+    const normFaqs = (arr) => arr.map((f) => ({
+        q: String(f?.q || '').trim().slice(0, 140),
+        a: String(f?.a || '').trim().slice(0, 360)
+    })).filter((f) => f.q && f.a);
+
+    const normRules = (arr) => arr.map((r) => String(r || '').trim().slice(0, 140)).filter(Boolean);
+
+    const normQr = (arr) => arr.filter((q) => q && q.title && q.body).map((q, idx) => ({
+        id: String(q.id || `qr_${idx}`),
+        title: String(q.title).trim().slice(0, 40),
+        body: String(q.body).trim().slice(0, 400)
+    }));
+
+    const offers = (mode === 'merge'
+        ? [...(prevCfg.offers || []), ...normOffers(rawOffers)]
+        : normOffers(rawOffers)).slice(0, BRAIN_LIMITS.maxOffers);
+    const products = (mode === 'merge'
+        ? [...(prevCfg.products || []), ...normProducts(rawProducts)]
+        : normProducts(rawProducts)).slice(0, BRAIN_LIMITS.maxProducts);
+    const faqs = (mode === 'merge'
+        ? [...(prevCfg.faqs || []), ...normFaqs(rawFaqs)]
+        : normFaqs(rawFaqs)).slice(0, BRAIN_LIMITS.maxFaqs);
+    const customRules = (mode === 'merge'
+        ? [...(prevCfg.customRules || []), ...normRules(rawRules)]
+        : normRules(rawRules)).slice(0, BRAIN_LIMITS.maxRules);
+    const quickReplies = rawQr
+        ? (mode === 'merge' ? [...(existingTenant?.quickReplies || []), ...normQr(rawQr)] : normQr(rawQr)).slice(0, BRAIN_LIMITS.maxQuickReplies)
+        : (existingTenant?.quickReplies || []);
+
+    const cleanConfig = {
+        businessName: String(incoming.businessName || prevCfg.businessName || existingTenant?.name || '').trim().slice(0, 80),
+        city: String(incoming.city ?? prevCfg.city ?? '').trim().slice(0, 60),
+        currency: String(incoming.currency || prevCfg.currency || 'INR').trim().slice(0, 12),
+        language: String(incoming.language || prevCfg.language || 'Auto (Match Customer)').trim().slice(0, 40),
+        tone: String(incoming.tone || prevCfg.tone || 'Natural & Helpful').trim().slice(0, 40),
+        emojiLevel: ['none', 'minimal', 'natural'].includes(incoming.emojiLevel) ? incoming.emojiLevel : (prevCfg.emojiLevel || 'minimal'),
+        announcement: String(incoming.announcement ?? prevCfg.announcement ?? '').trim().slice(0, BRAIN_LIMITS.maxAnnouncementChars),
+        offers,
+        products,
+        faqs,
+        customRules,
+        leadFields: ['name', 'intent', 'budget'],
+        ...(prevCfg.extraInstructions ? { extraInstructions: prevCfg.extraInstructions } : {})
+    };
+
+    const { compiledDigest, compressedByAi } = await compileClientKnowledgeDigest(cleanConfig);
+    cleanConfig.compiledDigest = compiledDigest;
+    cleanConfig.compressedByAi = compressedByAi;
+
+    return { cleanConfig, quickReplies };
+}
+
 export function createApiRouter() {
     const router = express.Router();
     router.use(csrfOriginGuard);
@@ -468,6 +560,16 @@ export function createApiRouter() {
             defaults.safety.maxDailyOut = Math.max(5, Math.min(1000, Number(req.body.maxDailyOut) || 90));
         }
 
+        if (req.body?.brainJson && typeof req.body.brainJson === 'object') {
+            const { cleanConfig, quickReplies } = await sanitizeAndCompileBrain(
+                req.body.brainJson,
+                { name: businessName, ...defaults },
+                'replace'
+            );
+            defaults.botConfig = cleanConfig;
+            defaults.quickReplies = quickReplies;
+        }
+
         const tenantDoc = {
             _id: tenantId,
             name: businessName,
@@ -554,6 +656,16 @@ export function createApiRouter() {
         if (saf.aiEnabled !== undefined) updates['safety.aiEnabled'] = Boolean(saf.aiEnabled);
         if (saf.voiceNotesEnabled !== undefined) updates['safety.voiceNotesEnabled'] = Boolean(saf.voiceNotesEnabled);
         if (saf.imageVisionEnabled !== undefined) updates['safety.imageVisionEnabled'] = Boolean(saf.imageVisionEnabled);
+
+        if (req.body?.brainJson && typeof req.body.brainJson === 'object') {
+            const { cleanConfig, quickReplies } = await sanitizeAndCompileBrain(
+                req.body.brainJson,
+                tenant,
+                req.body.brainMode === 'merge' ? 'merge' : 'replace'
+            );
+            updates.botConfig = cleanConfig;
+            updates.quickReplies = quickReplies;
+        }
 
         await cols.tenants.updateOne({ _id: tenantId }, { $set: updates });
 
@@ -993,61 +1105,8 @@ export function createApiRouter() {
             return res.status(403).json({ error: 'Knowledge editing is managed by your agency administrator.' });
         }
 
-        const incoming = req.body?.botConfig || {};
-        const quickReplies = Array.isArray(req.body?.quickReplies)
-            ? req.body.quickReplies
-                .filter((q) => q && q.title && q.body)
-                .slice(0, BRAIN_LIMITS.maxQuickReplies)
-                .map((q, idx) => ({
-                    id: String(q.id || `qr_${idx}`),
-                    title: String(q.title).trim().slice(0, 40),
-                    body: String(q.body).trim().slice(0, 400)
-                }))
-            : tenant.quickReplies;
-
-        // Strictly enforce slot & character caps so client cannot bloat prompts or free API quotas
-        const cleanConfig = {
-            businessName: String(incoming.businessName || tenant.botConfig?.businessName || tenant.name || '').trim().slice(0, 80),
-            city: String(incoming.city ?? tenant.botConfig?.city ?? '').trim().slice(0, 60),
-            currency: String(incoming.currency || tenant.botConfig?.currency || 'INR').trim().slice(0, 12),
-            language: String(incoming.language || tenant.botConfig?.language || 'Auto (Match Customer)').trim().slice(0, 40),
-            tone: String(incoming.tone || tenant.botConfig?.tone || 'Natural & Helpful').trim().slice(0, 40),
-            emojiLevel: ['none', 'minimal', 'natural'].includes(incoming.emojiLevel) ? incoming.emojiLevel : 'minimal',
-            announcement: String(incoming.announcement || '').trim().slice(0, BRAIN_LIMITS.maxAnnouncementChars),
-            offers: Array.isArray(incoming.offers)
-                ? incoming.offers.slice(0, BRAIN_LIMITS.maxOffers).map((o) => ({
-                    title: String(o.title || '').trim().slice(0, 60),
-                    deal: String(o.deal || '').trim().slice(0, 100),
-                    code: String(o.code || '').trim().slice(0, 32),
-                    active: o.active !== false
-                })).filter((o) => o.title && o.deal)
-                : [],
-            products: Array.isArray(incoming.products)
-                ? incoming.products.slice(0, BRAIN_LIMITS.maxProducts).map((p) => ({
-                    name: String(p.name || '').trim().slice(0, 70),
-                    price: String(p.price || '').trim().slice(0, 35),
-                    note: String(p.note || '').trim().slice(0, 120),
-                    active: p.active !== false
-                })).filter((p) => p.name)
-                : [],
-            faqs: Array.isArray(incoming.faqs)
-                ? incoming.faqs.slice(0, BRAIN_LIMITS.maxFaqs).map((f) => ({
-                    q: String(f.q || '').trim().slice(0, 140),
-                    a: String(f.a || '').trim().slice(0, 360)
-                })).filter((f) => f.q && f.a)
-                : [],
-            customRules: Array.isArray(incoming.customRules)
-                ? incoming.customRules.map((r) => String(r).trim().slice(0, 140)).filter(Boolean).slice(0, BRAIN_LIMITS.maxRules)
-                : [],
-            leadFields: ['name', 'intent', 'budget'],
-            // Preserve legacy extraInstructions cleanly if an existing client had one!
-            ...(tenant.botConfig?.extraInstructions ? { extraInstructions: tenant.botConfig.extraInstructions } : {})
-        };
-
-        // Recompile compressed digest from active items cleanly (edited/deleted entries vanish immediately!)
-        const { compiledDigest, compressedByAi } = await compileClientKnowledgeDigest(cleanConfig);
-        cleanConfig.compiledDigest = compiledDigest;
-        cleanConfig.compressedByAi = compressedByAi;
+        const mode = req.body?.mode === 'merge' ? 'merge' : 'replace';
+        const { cleanConfig, quickReplies } = await sanitizeAndCompileBrain(req.body, tenant, mode);
 
         await cols.tenants.updateOne(
             { _id: tenantId },
@@ -1066,7 +1125,7 @@ export function createApiRouter() {
             tenantId,
             'info',
             'ai',
-            `Saved Business Brain (${budget.counts.offers} offers, ${budget.counts.products} items, ${budget.counts.faqs} FAQs · ~${budget.estimatedTokens} prompt tokens${compressedByAi ? ', AI-compressed' : ''}).`
+            `Saved Business Brain (${budget.counts.offers} offers, ${budget.counts.products} items, ${budget.counts.faqs} FAQs · ~${budget.estimatedTokens} prompt tokens${cleanConfig.compressedByAi ? ', AI-compressed' : ''}).`
         );
         res.json({ ok: true, botConfig: cleanConfig, quickReplies, budget });
     });

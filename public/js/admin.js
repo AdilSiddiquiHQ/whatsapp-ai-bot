@@ -348,6 +348,11 @@ function renderModal() {
             </div>
           </div>
 
+          <div class="field">
+            <label>Bulk Import Catalog / Offers / FAQs JSON (Optional)</label>
+            <textarea name="brainJsonText" class="textarea mono" rows="3" placeholder='Optional: paste JSON {"offers":[...],"products":[...],"faqs":[...]}'></textarea>
+          </div>
+
           <button type="submit" class="btn-3d btn-3d-primary btn-full">${icon('plus', 'icon-sm')}<span>Create Client Account</span></button>
         </form>
       </div>
@@ -442,6 +447,11 @@ function renderModal() {
               </label>
             </div>
 
+            <div class="field">
+              <label>Bulk Replace Offers / Prices / FAQs via JSON (Optional &mdash; leave blank to keep existing)</label>
+              <textarea name="brainJsonText" class="textarea mono" rows="3" placeholder='Paste JSON {"announcement":"...","offers":[...],"products":[...],"faqs":[...]}'></textarea>
+            </div>
+
             <div class="row-gap" style="margin-bottom:14px;">
               <button type="submit" class="btn-3d btn-3d-primary" style="flex:1;">${icon('check', 'icon-sm')}<span>Save Prompt &amp; Config</span></button>
               <button type="button" id="ed-wa-reconnect" class="btn-3d btn-3d-secondary btn-sm">Reconnect WA</button>
@@ -534,6 +544,12 @@ function bindModalEvents() {
     cf.addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(cf);
+      let brainJson = null;
+      const rawJson = String(fd.get('brainJsonText') || '').trim();
+      if (rawJson) {
+        try { brainJson = JSON.parse(rawJson); }
+        catch (err) { toast(`Invalid Brain JSON: ${err.message}`, 'err'); return; }
+      }
       try {
         await api('/api/admin/tenants', {
           method: 'POST',
@@ -545,7 +561,8 @@ function bindModalEvents() {
             agencySystemPrompt: fd.get('agencySystemPrompt'),
             cloneFromTenantId: fd.get('cloneFromTenantId'),
             primaryModel: fd.get('primaryModel'),
-            maxDailyOut: Number(fd.get('maxDailyOut') || 90)
+            maxDailyOut: Number(fd.get('maxDailyOut') || 90),
+            ...(brainJson ? { brainJson } : {})
           }
         });
         toast('Client created with custom system prompt.');
@@ -563,6 +580,12 @@ function bindModalEvents() {
     edf.addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(edf);
+      let brainJson = null;
+      const rawJson = String(fd.get('brainJsonText') || '').trim();
+      if (rawJson) {
+        try { brainJson = JSON.parse(rawJson); }
+        catch (err) { toast(`Invalid Brain JSON: ${err.message}`, 'err'); return; }
+      }
       try {
         await api(`/api/admin/tenants/${encodeURIComponent(tid)}`, {
           method: 'PATCH',
@@ -582,7 +605,8 @@ function bindModalEvents() {
               maxHourlyOut: Number(fd.get('maxHourlyOut')),
               aiEnabled: Boolean(fd.get('aiEnabled')),
               voiceNotesEnabled: Boolean(fd.get('voiceNotesEnabled'))
-            }
+            },
+            ...(brainJson ? { brainJson, brainMode: 'replace' } : {})
           }
         });
         toast('Saved prompt & configuration (zero data lost).');

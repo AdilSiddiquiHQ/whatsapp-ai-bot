@@ -8,6 +8,9 @@ export function renderBrainView(container, ctx) {
   let industry = '';
   let budget = null;
   let allowEdit = true;
+  let importOpen = false;
+  let importText = '';
+  let importMode = 'replace';
 
   async function init() {
     container.innerHTML = `<div class="card"><span class="card-sub">Loading Business Brain...</span></div>`;
@@ -44,6 +47,8 @@ export function renderBrainView(container, ctx) {
           <div class="card-sub">Update offers, holiday notices, pricing &amp; FAQs here anytime &mdash; agency core prompt &amp; zero-hallucination shield remain active underneath.</div>
         </div>
         <div class="row-gap">
+          ${allowEdit ? `<button id="brain-import-btn" class="btn-3d btn-3d-secondary btn-sm">${icon('plus', 'icon-sm')}<span>Import JSON</span></button>` : ''}
+          <button id="brain-export-btn" class="btn-3d btn-3d-secondary btn-sm">${icon('download', 'icon-sm')}<span>Export JSON</span></button>
           <button id="brain-test-btn" class="btn-3d btn-3d-secondary">${icon('spark', 'icon-sm')}<span>Test in Preview</span></button>
           ${allowEdit ? `<button id="brain-save-btn" class="btn-3d btn-3d-primary">${icon('check', 'icon-sm')}<span>Save &amp; Sync AI</span></button>` : ''}
         </div>
@@ -190,6 +195,30 @@ export function renderBrainView(container, ctx) {
           </div>
         </div>
       </div>
+      ${importOpen ? `
+        <div class="modal-backdrop" id="import-backdrop">
+          <form id="import-json-form" class="modal" style="max-width:600px;">
+            <div class="row-between" style="margin-bottom:12px;">
+              <div>
+                <h3 class="card-title" style="font-size:16px;">Bulk Import Business JSON</h3>
+                <div class="card-sub">Paste JSON containing offers, announcement, products, faqs, customRules &amp; quickReplies</div>
+              </div>
+              <button type="button" id="import-close" class="btn-3d btn-3d-secondary btn-sm">Close</button>
+            </div>
+            <div class="row-between" style="margin-bottom:10px;">
+              <div class="row-gap">
+                <button type="button" id="mode-replace" class="chip ${importMode === 'replace' ? 'active' : ''}">Replace All</button>
+                <button type="button" id="mode-merge" class="chip ${importMode === 'merge' ? 'active' : ''}">Merge / Append</button>
+              </div>
+              <button type="button" id="load-sample-json" class="btn-3d btn-3d-secondary btn-sm">Load Sample Schema</button>
+            </div>
+            <div class="field">
+              <textarea id="import-json-text" class="textarea mono" rows="11" placeholder='{ "announcement": "...", "offers": [...], "products": [...], "faqs": [...], "customRules": [...], "quickReplies": [...] }' required>${escHtml(importText)}</textarea>
+            </div>
+            <button type="submit" id="import-submit" class="btn-3d btn-3d-primary btn-full">${icon('check', 'icon-sm')}<span>Import &amp; Sync AI</span></button>
+          </form>
+        </div>
+      ` : ''}
     `;
 
     const collectDraft = () => {
@@ -301,6 +330,93 @@ export function renderBrainView(container, ctx) {
         await api('/api/brain', { method: 'PUT', body: { botConfig, quickReplies } }).catch(() => {});
       }
       ctx.navigate('inbox');
+    });
+
+    container.querySelector('#brain-export-btn').addEventListener('click', () => {
+      collectDraft();
+      const exportObj = {
+        businessName: botConfig.businessName,
+        city: botConfig.city,
+        currency: botConfig.currency,
+        language: botConfig.language,
+        announcement: botConfig.announcement,
+        offers: botConfig.offers,
+        products: botConfig.products,
+        faqs: botConfig.faqs,
+        customRules: botConfig.customRules,
+        quickReplies
+      };
+      const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `business-brain-${(botConfig.businessName || 'export').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast('Exported Business Brain JSON.');
+    });
+
+    container.querySelector('#brain-import-btn')?.addEventListener('click', () => {
+      importOpen = true;
+      paint();
+    });
+    container.querySelector('#import-close')?.addEventListener('click', () => {
+      importOpen = false;
+      paint();
+    });
+    container.querySelector('#mode-replace')?.addEventListener('click', () => {
+      importText = container.querySelector('#import-json-text')?.value || '';
+      importMode = 'replace';
+      paint();
+    });
+    container.querySelector('#mode-merge')?.addEventListener('click', () => {
+      importText = container.querySelector('#import-json-text')?.value || '';
+      importMode = 'merge';
+      paint();
+    });
+    container.querySelector('#load-sample-json')?.addEventListener('click', () => {
+      const sample = {
+        currency: 'INR',
+        language: 'Auto (Match Customer)',
+        announcement: 'Zero Admission Fee this week! Free 1-Day Trial Pass available.',
+        offers: [{ title: 'Zero Admission', deal: 'Save Rs 1000 on 3M/6M/12M plans', code: 'FITSTART', active: true }],
+        products: [
+          { name: '1 Month Membership', price: '1800', note: 'Full floor + cardio access', active: true },
+          { name: '3 Months Quarterly', price: '4500', note: 'Zero admission + free BCA scan', active: true }
+        ],
+        faqs: [{ q: 'What are your gym timings?', a: 'Mon-Sat 5:30 AM to 10:30 PM, Sun 7 AM to 1 PM.' }],
+        customRules: ['Always ask visitors to carry indoor shoes & ID for trial pass.'],
+        quickReplies: [{ title: 'Trial Invite', body: 'Your 1-Day Free Trial Pass is ready! What time will you drop by?' }]
+      };
+      const el = container.querySelector('#import-json-text');
+      if (el) el.value = JSON.stringify(sample, null, 2);
+      importText = el?.value || '';
+    });
+    container.querySelector('#import-json-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const raw = container.querySelector('#import-json-text').value.trim();
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (err) {
+        toast(`Invalid JSON: ${err.message}`, 'err');
+        return;
+      }
+      const btn = container.querySelector('#import-submit');
+      btn.disabled = true;
+      try {
+        const res = await api('/api/brain', { method: 'PUT', body: { ...parsed, mode: importMode } });
+        botConfig = res.botConfig;
+        quickReplies = res.quickReplies;
+        budget = res.budget;
+        importOpen = false;
+        importText = '';
+        toast('JSON imported & compressed into AI knowledge cleanly.');
+        paint();
+      } catch (err) {
+        toast(err.message, 'err');
+        btn.disabled = false;
+      }
     });
   }
 
