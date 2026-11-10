@@ -1,12 +1,12 @@
 {
   "name": "whatsapp-ai-bot",
-  "version": "1.0.0",
-  "description": "24/7 WhatsApp AI Bot with Client Web Portal and Groq/OpenRouter",
+  "version": "2.0.0",
+  "description": "Multi-tenant 24/7 WhatsApp AI Automation & Agency SaaS Dashboard",
   "main": "server.mjs",
   "type": "module",
   "scripts": {
-    "start": "node server.mjs",
-    "dev": "node --watch server.mjs"
+    "start": "node --max-old-space-size=320 server.mjs",
+    "dev": "node --watch --max-old-space-size=320 server.mjs"
   },
   "dependencies": {
     "@google/genai": "^3.0.0",
@@ -18,6 +18,6 @@
     "qrcode": "^1.5.4"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

@@ -3,9 +3,14 @@ services:
     name: whatsapp-ai-bot
     runtime: node
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: npm install --omit=dev
+    startCommand: node --max-old-space-size=320 server.mjs
+    healthCheckPath: /health
     envVars:
+      - key: ADMIN_SECRET
+        sync: false
+      - key: AUTH_SECRET
+        generateValue: true
       - key: GEMINI_API_KEY
         sync: false
       - key: OPENROUTER_API_KEY
@@ -14,7 +19,9 @@ services:
         value: "openrouter/free"
       - key: MONGODB_URI
         sync: false
+      - key: MONGODB_DB_NAME
+        value: "whatsapp_bot"
       - key: GROQ_API_KEY
         sync: false
-      - key: SYSTEM_PROMPT
-        value: "You are a helpful, professional, and friendly AI assistant. Answer concisely with clean formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags."
+      - key: MAX_ACTIVE_WA_SESSIONS
+        value: "5"
