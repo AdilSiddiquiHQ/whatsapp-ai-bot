@@ -8,5 +8,11 @@ services:
     envVars:
       - key: GROQ_API_KEY
         sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
       - key: SYSTEM_PROMPT
-        value: "You are a smart, professional, and friendly AI assistant on WhatsApp. Answer concisely and clearly with natural formatting and emojis."
+        value: "You are a smart, professional, and friendly AI assistant on WhatsApp. Answer concisely and clearly with clean formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags."
