@@ -60,13 +60,19 @@ app.use(createApiRouter());
 
 // Dedicated static Admin Console route
 app.get('/admin', (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     res.sendFile(path.join(PUBLIC_DIR, 'admin.html'));
 });
 
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
-// Static assets (zero-build ESM files)
-app.use(express.static(PUBLIC_DIR, { maxAge: '1h', etag: true }));
+// Static assets (always revalidate via ETag so deploys apply immediately without stale JS caches)
+app.use(express.static(PUBLIC_DIR, {
+    etag: true,
+    setHeaders: (res) => {
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    }
+}));
 
 // Return crisp JSON 404 for unknown /api/* endpoints
 app.use('/api', (req, res) => {
@@ -75,6 +81,7 @@ app.use('/api', (req, res) => {
 
 // Client SPA fallback
 app.get('*', (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
