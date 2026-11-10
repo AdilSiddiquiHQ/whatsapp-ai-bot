@@ -335,9 +335,10 @@ function renderModal() {
             <div class="field">
               <label>Primary AI Model</label>
               <select name="primaryModel" class="select">
-                <option value="auto">Auto Fallback Chain (Gemini 3.8 -> Lite -> OpenRouter)</option>
-                <option value="gemini-3.8-flash">gemini-3.8-flash</option>
-                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+                <option value="auto">Auto Two-Lane (Text: Groq -> Gemini -> OpenRouter | Media: Gemini)</option>
+                <option value="groq">Groq First (openai/gpt-oss-20b fast)</option>
+                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Fast Minimal Think)</option>
+                <option value="gemini-3.8-flash">gemini-3.8-flash (Low Think)</option>
                 <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
                 <option value="openrouter">OpenRouter Free First</option>
               </select>
@@ -403,9 +404,10 @@ function renderModal() {
                 <label>Preferred Model</label>
                 <select name="primaryModel" id="ed-model" class="select">
                   ${[
-                    { v: 'auto', l: 'Auto Chain (Gemini -> OpenRouter -> Groq)' },
-                    { v: 'gemini-3.8-flash', l: 'gemini-3.8-flash (Smartest)' },
-                    { v: 'gemini-3.5-flash-lite', l: 'gemini-3.5-flash-lite (Fastest)' },
+                    { v: 'auto', l: 'Auto Two-Lane (Text: Groq -> Gemini -> OR | Media: Gemini)' },
+                    { v: 'groq', l: 'Groq First (openai/gpt-oss-20b)' },
+                    { v: 'gemini-3.5-flash-lite', l: 'gemini-3.5-flash-lite (Fast Minimal Think)' },
+                    { v: 'gemini-3.8-flash', l: 'gemini-3.8-flash (Low Think)' },
                     { v: 'gemini-3.1-flash-lite', l: 'gemini-3.1-flash-lite' },
                     { v: 'openrouter', l: 'OpenRouter Free First' }
                   ].map((o) => `<option value="${o.v}" ${(ai.primaryModel || 'auto') === o.v ? 'selected' : ''}>${o.l}</option>`).join('')}

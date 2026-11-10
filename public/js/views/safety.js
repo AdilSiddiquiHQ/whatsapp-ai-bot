@@ -113,6 +113,7 @@ export function renderSafetyView(container, ctx) {
               </select>
             </div>
             <div class="field"><label>Max Daily AI Replies</label><input id="s-daily" type="number" class="input mono" value="${safety.maxDailyOut || 90}" /></div>
+            <div class="field"><label>Max Turns / Customer (10m)</label><input id="s-p10m" type="number" min="2" max="50" class="input mono" value="${safety.perUserCustom ? (safety.perUser10m || 15) : Math.max(15, Number(safety.perUser10m || 15))}" /></div>
             <div class="field"><label>Debounce Wait (ms)</label><input id="s-debounce" type="number" class="input mono" value="${safety.debounceMs || 1800}" /></div>
           </div>
           <div class="field" style="margin-bottom:0;">
@@ -230,6 +231,7 @@ export function renderSafetyView(container, ctx) {
         warmupTier: container.querySelector('#s-warmup').value,
         groupMode: container.querySelector('#s-groups').value,
         maxDailyOut: Number(container.querySelector('#s-daily').value),
+        perUser10m: Number(container.querySelector('#s-p10m').value || 15),
         debounceMs: Number(container.querySelector('#s-debounce').value),
         webhookUrl: container.querySelector('#s-webhook').value,
         operatingMode: container.querySelector('#s-opmode').value,

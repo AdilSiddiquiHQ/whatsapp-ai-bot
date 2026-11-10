@@ -1430,13 +1430,6 @@ class WhatsAppTenantManager {
                 return;
             }
 
-            // Per-user flood guard
-            const p10m = tenant.safety?.perUser10m || 6;
-            if (!rt.userFloodLimiter.consume(`${peer.canonicalRef}:10m`, p10m, 10 * 60_000).allowed) {
-                await this.logAndEmit(tenantId, 'warn', 'safety', `Rate limit paused rapid replies for ${peer.phoneNumber}.`);
-                return;
-            }
-
             // Subscribe to live typing presence so debouncer waits if customer is typing message #2!
             sock.presenceSubscribe(peer.remoteJid).catch(() => {});
 
@@ -1645,6 +1638,14 @@ class WhatsAppTenantManager {
         }
 
         const llmStartedMs = Date.now();
+
+        // Debounced turn flood guard (counts merged AI reply turns, not individual burst bubbles!)
+        const p10m = tenant.safety?.perUserCustom ? (tenant.safety?.perUser10m || 15) : Math.max(15, Number(tenant.safety?.perUser10m || 15));
+        if (!rt.userFloodLimiter.consume(`${canonicalRef}:10m`, p10m, 10 * 60_000).allowed) {
+            await this.logAndEmit(tenantId, 'warn', 'safety', `Rate limit paused rapid AI replies for ${peer.phoneNumber} (${p10m} turns / 10m).`);
+            return;
+        }
+
         const existingLead = await cols.leads.findOne({ tenantId, contactRef: peer.canonicalRef }).catch(() => null);
         const systemPrompt = buildTenantSystemPrompt(
             tenant,
@@ -1813,7 +1814,7 @@ class WhatsAppTenantManager {
             tenantId,
             aiRes.isError ? 'warn' : 'info',
             'ai',
-            `Replied to ${nextFacts.name || convDoc.displayName || peer.phoneNumber} (${peer.phoneNumber}) via ${aiRes.model} in ${aiRes.latencyMs}ms.`
+            `Replied to ${nextFacts.name || convDoc.displayName || peer.phoneNumber} (${peer.phoneNumber}) via ${aiRes.model} in ${aiRes.latencyMs}ms${aiRes.fallbackNote ? ` [fallback after ${aiRes.fallbackNote}]` : ''}.`
         );
 
         // Capture/Enrich Rich Lead + Instant Deduplicated Owner Alert

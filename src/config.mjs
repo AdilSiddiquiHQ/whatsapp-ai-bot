@@ -34,16 +34,16 @@ export const BRAIN_LIMITS = {
     maxTotalSystemChars: 3800
 };
 
-// Verified 2026 model fallback chain
+// Verified 2026 fast model chains (lite minimal-think first, then low-think 3.8; Groq 20b speed first)
 export const GEMINI_MODELS = [
-    'gemini-3.8-flash',
     'gemini-3.5-flash-lite',
+    'gemini-3.8-flash',
     'gemini-3.1-flash-lite'
 ];
 
 export const GROQ_MODELS = [
-    'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
     'qwen/qwen3.8-27b'
 ];
 
@@ -145,8 +145,8 @@ export function createDefaultTenantConfig(
             warmupTier: 'warming',
             maxDailyOut: 90,
             maxHourlyOut: 18,
-            perUser10m: 6,
-            perUser24h: 25,
+            perUser10m: 15,
+            perUser24h: 40,
             takeoverMinutes: 30,
             debounceMs: 1800,
             groupMode: 'ignore_all',

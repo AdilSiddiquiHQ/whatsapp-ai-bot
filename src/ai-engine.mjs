@@ -411,8 +411,9 @@ function extractInteractionText(interaction) {
 }
 
 /**
- * Generates an AI reply with 3-tier fallback (Gemini 2026 -> OpenRouter Free -> Groq),
- * reasoning suppression, anti-slop sanitization & deterministic guardrail grounding checks.
+ * Two-Lane AI Router:
+ * - Image / Audio messages: Gemini (minimal/low thinking) -> Groq notice -> OpenRouter
+ * - Text messages (default 'auto'): Groq (fast gpt-oss-20b, hidden/low reasoning) -> Gemini -> OpenRouter
  */
 export async function generateAIReply({
     systemPrompt,
@@ -437,11 +438,8 @@ export async function generateAIReply({
     const maxTokens = Number.isFinite(Number(aiConfig?.maxOutputTokens))
         ? Math.min(750, Math.max(180, Number(aiConfig.maxOutputTokens)))
         : 460;
-    const preferred = String(aiConfig?.primaryModel || 'auto');
-
-    const orderedGeminiModels = GEMINI_MODELS.includes(preferred)
-        ? [preferred, ...GEMINI_MODELS.filter((m) => m !== preferred)]
-        : GEMINI_MODELS;
+    const preferred = String(aiConfig?.primaryModel || 'auto').trim();
+    const hasMedia = Boolean(mediaAttachment?.data && mediaAttachment?.mimeType);
 
     const recentTurns = contextTurns.slice(-10).map((t) => ({
         role: t.role === 'assistant' ? 'assistant' : 'user',
@@ -449,9 +447,11 @@ export async function generateAIReply({
     }));
     const resolvedFollowUp = isFollowUp !== null ? Boolean(isFollowUp) : recentTurns.length > 0;
     const queryForGrounding = customerQuery || rawUserInput;
+    const attempts = [];
 
     const finalize = (raw, model) => {
         const { cleanText, isNoReply, voiceIntent, leadData, handoffData } = extractAndStripTags(raw);
+        const fallbackNote = attempts.length > 0 ? attempts.join(' -> ') : '';
 
         if (isNoReply) {
             return {
@@ -460,6 +460,7 @@ export async function generateAIReply({
                 guardrailBlocked: false,
                 guardrailReason: handoffData ? `handoff_silent:${handoffData.reason}` : 'model_no_reply',
                 model,
+                fallbackNote,
                 latencyMs: Date.now() - startedAt,
                 voiceIntent,
                 leadData,
@@ -488,6 +489,7 @@ export async function generateAIReply({
                 guardrailBlocked: false,
                 guardrailReason: guardRes.reason,
                 model,
+                fallbackNote,
                 latencyMs: Date.now() - startedAt,
                 voiceIntent,
                 leadData,
@@ -503,6 +505,7 @@ export async function generateAIReply({
                 guardrailReason: guardRes.reason,
                 quarantinedText: guardRes.quarantinedText,
                 model,
+                fallbackNote,
                 latencyMs: Date.now() - startedAt,
                 voiceIntent,
                 leadData: null,
@@ -515,50 +518,13 @@ export async function generateAIReply({
             isNoReply: false,
             guardrailBlocked: false,
             model,
+            fallbackNote,
             latencyMs: Date.now() - startedAt,
             voiceIntent,
             leadData,
             handoffData
         };
     };
-
-    // 1. Primary: Google Gemini 2026 Models via Interactions API
-    if (geminiClient && preferred !== 'openrouter') {
-        const steps = recentTurns.map((t) => ({
-            type: t.role === 'assistant' ? 'model_output' : 'user_input',
-            content: [{ type: 'text', text: t.text }]
-        }));
-
-        const currentParts = [{ type: 'text', text: boxedUserText }];
-        if (mediaAttachment?.data && mediaAttachment?.mimeType) {
-            if (mediaAttachment.type === 'audio') {
-                currentParts.push({ type: 'audio', data: mediaAttachment.data, mime_type: mediaAttachment.mimeType });
-            } else if (mediaAttachment.type === 'image') {
-                currentParts.push({ type: 'image', data: mediaAttachment.data, mime_type: mediaAttachment.mimeType });
-            }
-        }
-        steps.push({ type: 'user_input', content: currentParts });
-
-        for (const modelId of orderedGeminiModels) {
-            try {
-                const interaction = await Promise.race([
-                    geminiClient.interactions.create({
-                        model: modelId,
-                        system_instruction: systemPrompt,
-                        input: steps,
-                        store: false,
-                        generation_config: { max_output_tokens: maxTokens, temperature: temp, top_p: 0.88 }
-                    }),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout (12s)')), 12_000))
-                ]);
-                const raw = extractInteractionText(interaction);
-                if (raw) return finalize(raw, modelId);
-            } catch (err) {
-                console.warn(`[AI Engine] Gemini '${modelId}' fallback:`, err.status || err.message);
-                if (err.status === 401 || err.status === 403) break;
-            }
-        }
-    }
 
     let fallbackUserText = boxedUserText;
     if (mediaAttachment) {
@@ -577,11 +543,128 @@ export async function generateAIReply({
         { role: 'user', content: fallbackUserText }
     ];
 
-    // 2. Secondary: OpenRouter Auto-Free Router (with explicit reasoning suppression)
-    if (CONFIG.OPENROUTER_API_KEY) {
-        try {
+    const runGroq = async () => {
+        if (!CONFIG.GROQ_API_KEY) return null;
+        const orderedGroq = GROQ_MODELS.includes(preferred)
+            ? [preferred, ...GROQ_MODELS.filter((m) => m !== preferred)]
+            : GROQ_MODELS;
+
+        for (const modelId of orderedGroq) {
             const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 14_000);
+            const timer = setTimeout(() => controller.abort(), 5_500);
+            try {
+                const bodyPayload = {
+                    model: modelId,
+                    messages: chatMessages,
+                    max_tokens: Math.max(maxTokens, 550),
+                    temperature: temp,
+                    top_p: 0.88,
+                    reasoning_effort: 'low',
+                    reasoning_format: 'hidden'
+                };
+                let resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${CONFIG.GROQ_API_KEY}`
+                    },
+                    body: JSON.stringify(bodyPayload),
+                    signal: controller.signal
+                });
+                clearTimeout(timer);
+
+                // If a specific Groq model rejects reasoning params, retry cleanly once without them
+                if (resp.status === 400) {
+                    const retryPayload = {
+                        model: modelId,
+                        messages: chatMessages,
+                        max_tokens: Math.max(maxTokens, 550),
+                        temperature: temp,
+                        top_p: 0.88
+                    };
+                    resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${CONFIG.GROQ_API_KEY}`
+                        },
+                        body: JSON.stringify(retryPayload),
+                        signal: AbortSignal.timeout(5_500)
+                    });
+                }
+
+                if (resp.ok) {
+                    const data = await resp.json();
+                    const raw = data?.choices?.[0]?.message?.content?.trim();
+                    if (raw) return finalize(raw, modelId);
+                    attempts.push(`${modelId}:empty`);
+                } else {
+                    attempts.push(`${modelId}:${resp.status}`);
+                    if (resp.status === 401 || resp.status === 403) break;
+                }
+            } catch (err) {
+                clearTimeout(timer);
+                attempts.push(`${modelId}:${err.name === 'AbortError' ? 'timeout' : 'err'}`);
+            }
+        }
+        return null;
+    };
+
+    const runGemini = async () => {
+        if (!geminiClient) return null;
+        const orderedGemini = GEMINI_MODELS.includes(preferred)
+            ? [preferred, ...GEMINI_MODELS.filter((m) => m !== preferred)]
+            : GEMINI_MODELS;
+
+        const steps = recentTurns.map((t) => ({
+            type: t.role === 'assistant' ? 'model_output' : 'user_input',
+            content: [{ type: 'text', text: t.text }]
+        }));
+        const currentParts = [{ type: 'text', text: boxedUserText }];
+        if (hasMedia) {
+            currentParts.push({
+                type: mediaAttachment.type === 'audio' ? 'audio' : 'image',
+                data: mediaAttachment.data,
+                mime_type: mediaAttachment.mimeType
+            });
+        }
+        steps.push({ type: 'user_input', content: currentParts });
+
+        const geminiTimeoutMs = hasMedia ? 10_000 : 6_500;
+        for (const modelId of orderedGemini) {
+            try {
+                const interaction = await Promise.race([
+                    geminiClient.interactions.create({
+                        model: modelId,
+                        system_instruction: systemPrompt,
+                        input: steps,
+                        store: false,
+                        generation_config: {
+                            max_output_tokens: Math.max(maxTokens, 650),
+                            temperature: temp,
+                            thinking_level: modelId.includes('lite') ? 'minimal' : 'low'
+                        }
+                    }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), geminiTimeoutMs))
+                ]);
+                const raw = extractInteractionText(interaction);
+                if (raw) return finalize(raw, modelId);
+                attempts.push(`${modelId}:empty`);
+            } catch (err) {
+                const code = err.status || (err.message === 'timeout' ? 'timeout' : 'err');
+                attempts.push(`${modelId}:${code}`);
+                console.warn(`[AI Engine] Gemini '${modelId}' fallback:`, code, err.message);
+                if (err.status === 401 || err.status === 403) break;
+            }
+        }
+        return null;
+    };
+
+    const runOpenRouter = async () => {
+        if (!CONFIG.OPENROUTER_API_KEY) return null;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 11_000);
+        try {
             const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
                 method: 'POST',
                 headers: {
@@ -607,52 +690,45 @@ export async function generateAIReply({
                 const data = await resp.json();
                 const raw = data?.choices?.[0]?.message?.content?.trim();
                 if (raw) return finalize(raw, data.model || CONFIG.OPENROUTER_MODEL);
+                attempts.push('openrouter:empty');
+            } else {
+                attempts.push(`openrouter:${resp.status}`);
             }
         } catch (err) {
+            clearTimeout(timer);
+            attempts.push(`openrouter:${err.name === 'AbortError' ? 'timeout' : 'err'}`);
             console.warn('[AI Engine] OpenRouter fallback error:', err.message);
         }
+        return null;
+    };
+
+    // Select Two-Lane Provider Order:
+    // - Voice Notes & Photos ALWAYS prioritize Gemini first (native audio/vision)
+    // - Text messages default to Groq -> Gemini -> OpenRouter unless explicitly overridden
+    let chain;
+    if (hasMedia) {
+        chain = [runGemini, runGroq, runOpenRouter];
+    } else if (preferred === 'openrouter') {
+        chain = [runOpenRouter, runGroq, runGemini];
+    } else if (GEMINI_MODELS.includes(preferred)) {
+        chain = [runGemini, runGroq, runOpenRouter];
+    } else {
+        chain = [runGroq, runGemini, runOpenRouter];
     }
 
-    // 3. Tertiary: Groq
-    if (CONFIG.GROQ_API_KEY) {
-        for (const modelId of GROQ_MODELS) {
-            try {
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 12_000);
-                const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${CONFIG.GROQ_API_KEY}`
-                    },
-                    body: JSON.stringify({
-                        model: modelId,
-                        messages: chatMessages,
-                        max_tokens: maxTokens,
-                        temperature: temp,
-                        top_p: 0.88
-                    }),
-                    signal: controller.signal
-                });
-                clearTimeout(timer);
-
-                if (resp.ok) {
-                    const data = await resp.json();
-                    const raw = data?.choices?.[0]?.message?.content?.trim();
-                    if (raw) return finalize(raw, modelId);
-                }
-                if (resp.status === 401) break;
-            } catch {}
-        }
+    for (const runProvider of chain) {
+        const out = await runProvider();
+        if (out) return out;
     }
 
-    // Provider unavailable -> stay unseen for owner team rather than faking a reply
+    // All providers failed/rate-limited -> stay unseen for owner team rather than faking a reply
     return {
         text: '',
         isNoReply: true,
         guardrailBlocked: false,
-        guardrailReason: 'provider_unavailable',
+        guardrailReason: `provider_unavailable (${attempts.join(', ') || 'no_keys'})`,
         model: 'fallback-unseen',
+        fallbackNote: attempts.join(' -> '),
         latencyMs: Date.now() - startedAt,
         voiceIntent: null,
         leadData: null,
