@@ -82,6 +82,7 @@ export async function initDatabase() {
         cols.messages.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
 
         cols.leads.createIndex({ tenantId: 1, contactRef: 1 }, { unique: true }),
+        cols.leads.createIndex({ tenantId: 1, stage: 1, updatedAt: -1 }),
         cols.leads.createIndex({ tenantId: 1, createdAt: -1 }),
 
         cols.analyticsDaily.createIndex({ tenantId: 1, date: -1 }),

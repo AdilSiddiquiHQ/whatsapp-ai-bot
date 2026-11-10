@@ -2,7 +2,7 @@ import { api, escHtml, formatWhatsAppHtml, formatClock, relativeTime, toast } fr
 import { icon } from '../icons.js';
 
 export function renderInboxView(container, ctx) {
-  let filter = 'all';
+  let filter = ctx.initialFilter || 'all';
   let searchQ = '';
   let threads = [];
   let selectedId = ctx.initialConvId || null;
@@ -85,19 +85,20 @@ export function renderInboxView(container, ctx) {
             ` : threads.map((t) => {
               const p = isPausedNow(t);
               const active = t._id === selectedId;
+              const isUnseen = t.aiStatus === 'human_needed' || t.unseenForOwner;
               return `
-                <div class="thread-item ${active ? 'active' : ''}" data-conv-id="${escHtml(t._id)}">
+                <div class="thread-item ${active ? 'active' : ''} ${isUnseen ? 'unseen-owner' : ''}" data-conv-id="${escHtml(t._id)}">
                   <div class="row-between" style="margin-bottom:2px;">
                     <div class="row-gap" style="min-width:0;">
-                      <span class="dot ${t.optedOut ? 'dot-rose' : (p || t.aiStatus === 'human_needed') ? 'dot-amber' : 'dot-emerald'}"></span>
+                      <span class="dot ${t.optedOut ? 'dot-rose' : (p || isUnseen) ? 'dot-amber' : 'dot-emerald'}"></span>
                       <span style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(t.displayName || t.phoneNumber)}</span>
                     </div>
                     <span class="tabular muted" style="font-size:11px;">${relativeTime(t.lastMessageAt)}</span>
                   </div>
-                  <div class="mono muted" style="font-size:11px;margin-bottom:3px;">${escHtml(t.phoneNumber || t.externalRef)} &middot; WA</div>
+                  <div class="mono muted" style="font-size:11px;margin-bottom:3px;">${escHtml(t.phoneNumber || t.externalRef)} &middot; ${isUnseen ? '<span style="color:var(--amber);font-weight:600;">Unseen · Needs You</span>' : 'WA'}</div>
                   <div class="row-between">
                     <span class="card-sub" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(t.lastMessagePreview || '')}</span>
-                    ${t.unreadCount > 0 ? `<span class="pill pill-emerald tabular" style="padding:1px 6px;font-size:10px;">${t.unreadCount}</span>` : ''}
+                    ${t.unreadCount > 0 ? `<span class="pill ${isUnseen ? 'pill-amber' : 'pill-emerald'} tabular" style="padding:1px 6px;font-size:10px;">${t.unreadCount}</span>` : ''}
                   </div>
                 </div>
               `;
@@ -115,8 +116,8 @@ export function renderInboxView(container, ctx) {
                   <span class="pill pill-emerald" style="font-size:10px;">WhatsApp</span>
                   ${activeThread.optedOut
                     ? `<span class="pill pill-rose">Opted Out</span>`
-                    : activeThread.aiStatus === 'human_needed'
-                      ? `<span class="pill pill-amber">Needs Human (AI Escalated)</span>`
+                    : (activeThread.aiStatus === 'human_needed' || activeThread.unseenForOwner)
+                      ? `<span class="pill pill-amber">${activeThread.unseenForOwner ? 'Unseen on WhatsApp · Needs You' : 'Needs Human'}</span>`
                       : paused
                         ? `<span class="pill pill-amber">AI Paused (${pauseMinsLeft > 1000 ? 'Manual' : `${pauseMinsLeft}m`})</span>`
                         : `<span class="pill pill-emerald">AI Active</span>`}
@@ -212,7 +213,7 @@ export function renderInboxView(container, ctx) {
                 <div class="field">
                   <label>Lead Pipeline Stage</label>
                   <select id="insp-stage" class="select">
-                    ${['new', 'qualified', 'booked', 'resolved'].map((st) => `<option value="${st}" ${activeThread.stage === st ? 'selected' : ''}>${st.toUpperCase()}</option>`).join('')}
+                    ${['new', 'qualified', 'booked', 'won', 'lost'].map((st) => `<option value="${st}" ${(activeThread.stage || 'new') === st ? 'selected' : ''}>${st.toUpperCase()}</option>`).join('')}
                   </select>
                 </div>
                 ${activeLead ? `
@@ -352,8 +353,9 @@ export function renderInboxView(container, ctx) {
     paint();
     try {
       const res = await api('/api/sandbox/chat', { method: 'POST', body: { text: txt } });
-      const handoffTag = res.handoffData ? ` · HANDOFF TRIGGERED (${res.handoffData.reason})` : '';
-      sandboxMsgs.push({ role: 'assistant', text: res.reply, meta: `${res.model} · ${res.latencyMs}ms${handoffTag}` });
+      const silentTag = res.isNoReply ? ' · SILENT / UNSEEN' : '';
+      const handoffTag = res.handoffData ? ` · HANDOFF (${res.handoffData.reason})` : '';
+      sandboxMsgs.push({ role: 'assistant', text: res.reply, meta: `${res.model} · ${res.latencyMs}ms${silentTag}${handoffTag}` });
     } catch (err) {
       sandboxMsgs.push({ role: 'assistant', text: `Error: ${err.message}`, meta: 'error' });
     }

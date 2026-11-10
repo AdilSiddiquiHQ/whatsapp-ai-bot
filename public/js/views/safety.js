@@ -52,16 +52,39 @@ export function renderSafetyView(container, ctx) {
           <div class="card-title" style="margin-bottom:12px;">Core AI &amp; WhatsApp Behaviors</div>
           <div style="display:flex;flex-direction:column;gap:12px;">
             ${toggleRow('s-aiEnabled', 'Master AI Auto-Responder', 'When OFF, Inbox stays live but AI sends zero WhatsApp replies', safety.aiEnabled)}
-            ${toggleRow('s-voice', 'Voice Note Understanding (Gemini)', 'Listens & transcribes WhatsApp audio messages in RAM with zero DB storage', safety.voiceNotesEnabled !== false)}
-            ${toggleRow('s-image', 'Photo & Receipt Vision', 'Reads product photos or screenshots sent by customers on WhatsApp', safety.imageVisionEnabled !== false)}
-            ${toggleRow('s-read', 'Human Read Receipts (Blue Ticks)', 'Marks messages as read only after realistic reading dwell time', safety.readReceipts !== false)}
-            ${toggleRow('s-quote', 'Quote Customer Message on Reply', 'Quotes specific customer text when replying in multi-message bursts', safety.quoteReplies !== false)}
-            ${toggleRow('s-split', 'Multi-Bubble Human Delivery', 'Splits long paragraphs into 2-3 natural WhatsApp bubbles', safety.splitLongReplies)}
+            ${toggleRow('s-voice', 'Voice Note Understanding (Gemini)', 'Listens & transcribes WhatsApp audio in RAM (zero DB audio stored; >90s held for team)', safety.voiceNotesEnabled !== false)}
+            ${toggleRow('s-image', 'Photo & Receipt Vision', 'Reads photos/screenshots safely (never auto-confirms UPI payment receipts)', safety.imageVisionEnabled !== false)}
+            ${toggleRow('s-read', 'Smart Read Receipts (Blue Ticks)', 'Marks read ONLY when replying; keeps unknown/off-topic chats unseen on your phone!', safety.readReceipts !== false)}
+            ${toggleRow('s-phatic', 'Closure Emoji Reactions (👍)', 'Reacts 👍 to closing "Ok / Thanks" replies at zero AI cost', safety.phaticReactionEnabled !== false)}
+            ${toggleRow('s-quote', 'Smart Context Quoting', 'Auto-quotes ONLY on multi-message bursts (3+), >30s delays, or group chats', safety.quoteReplies !== false)}
+            ${toggleRow('s-split', '2-Bubble Human Delivery', 'Splits answers from follow-up qualifying questions with realistic typing cadence', safety.splitLongReplies !== false)}
           </div>
         </div>
 
         <div class="card">
-          <div class="card-title" style="margin-bottom:12px;">Human Takeover, Groups &amp; Warmup Caps</div>
+          <div class="card-title" style="margin-bottom:12px;">Alerts, Revival &amp; Warmup Caps</div>
+          <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px;">
+            ${toggleRow('s-hotAlert', 'Instant Hot-Lead & Booking WhatsApp Alerts', 'Pings your Note-to-Self (or Owner Phone below) once when hot lead or slot locks', safety.hotLeadAlertEnabled !== false)}
+            ${toggleRow('s-followup', 'Safe 1-Shot Ghosted-Inquiry Revival', 'Sends 1 gentle check-in after inactivity during business hours only', Boolean(safety.followUpEnabled))}
+            ${toggleRow('s-digest', 'Daily Evening Summary Digest', 'Sends 1 daily tally to your WhatsApp Note-to-Self at configured hour', Boolean(safety.dailyDigestEnabled))}
+          </div>
+          <div class="equal-col" style="gap:10px;">
+            <div class="field">
+              <label>Owner Alert WhatsApp (blank = Note-to-Self)</label>
+              <input id="s-ownerPhone" class="input mono" placeholder="Leave blank for Note-to-Self" value="${escHtml(safety.ownerAlertPhone || '')}" />
+            </div>
+            <div class="field">
+              <label>Revival Wait &amp; Digest Hour</label>
+              <div class="row-gap">
+                <select id="s-followupHrs" class="select">
+                  ${[2, 4, 6, 12].map((h) => `<option value="${h}" ${Number(safety.followUpDelayHours || 4) === h ? 'selected' : ''}>After ${h}h</option>`).join('')}
+                </select>
+                <select id="s-digestHour" class="select">
+                  ${[18, 19, 20, 21, 22].map((hr) => `<option value="${hr}" ${Number(safety.dailyDigestHour ?? 20) === hr ? 'selected' : ''}>${hr}:00</option>`).join('')}
+                </select>
+              </div>
+            </div>
+          </div>
           <div class="field">
             <label>Owner-Reply Auto-Pause Duration (when you reply from phone/desktop)</label>
             <select id="s-takeover" class="select">
@@ -194,8 +217,15 @@ export function renderSafetyView(container, ctx) {
         voiceNotesEnabled: container.querySelector('#s-voice').checked,
         imageVisionEnabled: container.querySelector('#s-image').checked,
         readReceipts: container.querySelector('#s-read').checked,
+        phaticReactionEnabled: container.querySelector('#s-phatic').checked,
         quoteReplies: container.querySelector('#s-quote').checked,
         splitLongReplies: container.querySelector('#s-split').checked,
+        hotLeadAlertEnabled: container.querySelector('#s-hotAlert').checked,
+        ownerAlertPhone: container.querySelector('#s-ownerPhone').value.trim(),
+        followUpEnabled: container.querySelector('#s-followup').checked,
+        followUpDelayHours: Number(container.querySelector('#s-followupHrs').value),
+        dailyDigestEnabled: container.querySelector('#s-digest').checked,
+        dailyDigestHour: Number(container.querySelector('#s-digestHour').value),
         takeoverMinutes: Number(container.querySelector('#s-takeover').value),
         warmupTier: container.querySelector('#s-warmup').value,
         groupMode: container.querySelector('#s-groups').value,

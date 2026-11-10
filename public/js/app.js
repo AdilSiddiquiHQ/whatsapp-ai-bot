@@ -13,6 +13,7 @@ const state = {
   user: null,
   activeTab: 'overview',
   initialConvId: null,
+  initialFilter: null,
   sse: null,
   activeListener: null,
   cmdOpen: false,
@@ -144,6 +145,7 @@ const NAV_ITEMS = [
 function navigate(tab, opts = {}) {
   state.activeTab = tab;
   state.initialConvId = opts.convId || null;
+  state.initialFilter = opts.filter || null;
   renderActiveView();
   document.querySelectorAll('.nav-item[data-tab]').forEach((b) => {
     b.classList.toggle('active', b.dataset.tab === tab);
@@ -170,6 +172,7 @@ function renderShell() {
           ${NAV_ITEMS.map((item) => `
             <button class="nav-item ${state.activeTab === item.id ? 'active' : ''}" data-tab="${item.id}">
               <span class="nav-item-left">${icon(item.icon, 'icon')}<span>${item.label}</span></span>
+              ${item.id === 'inbox' ? `<span id="nav-unseen-badge" class="pill pill-amber tabular ${u.unseenHumanNeeded > 0 ? '' : 'hidden'}" style="font-size:10px;padding:1px 6px;">${u.unseenHumanNeeded || 0}</span>` : ''}
             </button>
           `).join('')}
         </nav>
@@ -232,6 +235,7 @@ function renderActiveView() {
   const ctx = {
     user: state.user,
     initialConvId: state.initialConvId,
+    initialFilter: state.initialFilter,
     navigate,
     toggleTheme,
     syncStatusUi
@@ -248,10 +252,17 @@ function renderActiveView() {
 
 function syncStatusUi() {
   const pill = document.getElementById('sidebar-wa-pill');
-  if (!pill || !state.user) return;
-  const open = state.user.waStatus === 'open';
-  pill.className = `pill ${open ? 'pill-emerald' : 'pill-amber'}`;
-  pill.innerHTML = `<span class="row-gap"><span class="dot ${open ? 'dot-emerald' : 'dot-amber'}"></span><span>${open ? 'WhatsApp Live' : 'WA ' + escHtml(state.user.waStatus)}</span></span>`;
+  if (pill && state.user) {
+    const open = state.user.waStatus === 'open';
+    pill.className = `pill ${open ? 'pill-emerald' : 'pill-amber'}`;
+    pill.innerHTML = `<span class="row-gap"><span class="dot ${open ? 'dot-emerald' : 'dot-amber'}"></span><span>${open ? 'WhatsApp Live' : 'WA ' + escHtml(state.user.waStatus)}</span></span>`;
+  }
+  const badge = document.getElementById('nav-unseen-badge');
+  if (badge && state.user) {
+    const n = Number(state.user.unseenHumanNeeded || 0);
+    badge.textContent = String(n);
+    badge.classList.toggle('hidden', n <= 0);
+  }
 }
 
 function connectSSE() {
@@ -267,6 +278,14 @@ function connectSSE() {
         if (data.qrDataUrl !== undefined && state.user) state.user.qrDataUrl = data.qrDataUrl;
         if (data.waPhone && state.user) state.user.waPhone = data.waPhone;
         syncStatusUi();
+      }
+      if (eventType === 'inbox_msg' && state.user) {
+        api('/api/auth/me').then((m) => {
+          if (m?.user && state.user) {
+            state.user.unseenHumanNeeded = m.user.unseenHumanNeeded || 0;
+            syncStatusUi();
+          }
+        }).catch(() => {});
       }
       if (typeof state.activeListener === 'function') {
         state.activeListener(eventType, data);

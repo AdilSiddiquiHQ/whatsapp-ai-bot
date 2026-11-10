@@ -53,11 +53,22 @@ export const WARMUP_PRESETS = {
     aged: { label: 'Aged Business (30+ Days)', maxDailyOut: 220, maxHourlyOut: 30 }
 };
 
+// Unified CRM Funnel Stages across Inbox, Leads Kanban & Analytics
+export const LEAD_STAGES = ['new', 'qualified', 'booked', 'won', 'lost'];
+
+export function normalizeLeadStage(stage) {
+    const s = String(stage || '').toLowerCase().trim();
+    if (s === 'contacted') return 'qualified';
+    if (s === 'converted' || s === 'resolved') return 'won';
+    if (LEAD_STAGES.includes(s)) return s;
+    return 'new';
+}
+
 export const ADMIN_PROMPT_TEMPLATES = {
     sales_concierge: {
         label: 'Sales & Service Concierge',
         industry: 'Service & Retail Business',
-        prompt: 'You handle WhatsApp customer inquiries for this business. Answer questions fast, quote exact prices/offers, clarify what the buyer needs, and invite them to confirm their booking or order.'
+        prompt: 'You handle WhatsApp customer inquiries for this business. Answer questions fast, quote exact prices/offers, clarify what the buyer needs one simple question at a time, and invite them to confirm their booking or order.'
     },
     clinic: {
         label: 'Clinic / Doctor / Dental Desk',
@@ -72,12 +83,12 @@ export const ADMIN_PROMPT_TEMPLATES = {
     real_estate: {
         label: 'Real Estate / Property Desk',
         industry: 'Real Estate',
-        prompt: 'You qualify property inquiries on WhatsApp. Share verified project specs and pricing ranges, ask for preferred budget/configuration/move-in timeline naturally, and offer a site visit slot.'
+        prompt: 'You qualify property inquiries on WhatsApp. Share verified project specs and pricing ranges, ask one clear question at a time (like preferred 2BHK/3BHK option or budget), and offer two convenient site visit slots.'
     },
     salon_gym: {
         label: 'Salon / Fitness Studio',
         industry: 'Salon & Fitness',
-        prompt: 'You manage bookings and membership queries on WhatsApp. Highlight current package deals, share session/membership rates accurately, and ask which day/time suits them to reserve a slot.'
+        prompt: 'You manage bookings and membership queries on WhatsApp. Highlight current package deals, share session/membership rates accurately, clarify their main goal first, and offer easy visit slots to reserve a trial or signup.'
     }
 };
 
@@ -93,12 +104,12 @@ export function createDefaultTenantConfig(
         industry: String(industry || 'Service & Retail Business').trim().slice(0, 80),
         agencySystemPrompt:
             String(agencySystemPrompt || '').trim().slice(0, BRAIN_LIMITS.maxAgencyPromptChars) ||
-            `You handle WhatsApp customer inquiries for ${businessName} (${industry}). Help customers quickly, verify requirements politely, and guide serious buyers toward booking.`,
+            `You handle WhatsApp customer inquiries for ${businessName} (${industry}). Help customers quickly, verify requirements one question at a time, and guide serious buyers toward booking.`,
         aiConfig: {
             primaryModel: String(aiConfig.primaryModel || 'auto'),
             temperature: Number.isFinite(Number(aiConfig.temperature))
                 ? Math.min(0.75, Math.max(0.1, Number(aiConfig.temperature)))
-                : 0.42,
+                : 0.35,
             maxOutputTokens: Number.isFinite(Number(aiConfig.maxOutputTokens))
                 ? Math.min(750, Math.max(180, Number(aiConfig.maxOutputTokens)))
                 : 460,
@@ -127,7 +138,7 @@ export function createDefaultTenantConfig(
             ],
             compiledDigest: '',
             compressedByAi: false,
-            leadFields: ['name', 'intent', 'budget']
+            leadFields: ['name', 'goal', 'plan', 'budget', 'slot']
         },
         safety: {
             aiEnabled: true,
@@ -154,7 +165,14 @@ export function createDefaultTenantConfig(
             sendAwayMessage: false,
             readReceipts: true,
             quoteReplies: true,
-            splitLongReplies: false,
+            splitLongReplies: true,
+            phaticReactionEnabled: true,
+            hotLeadAlertEnabled: true,
+            ownerAlertPhone: '',
+            dailyDigestEnabled: false,
+            dailyDigestHour: 20,
+            followUpEnabled: false,
+            followUpDelayHours: 4,
             voiceNotesEnabled: true,
             imageVisionEnabled: true,
             optOutKeywords: ['stop', 'stopall', 'unsubscribe', 'cancel', 'optout', 'opt out'],

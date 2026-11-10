@@ -3,13 +3,30 @@ import { icon } from '../icons.js';
 
 export function renderLeadsView(container, ctx) {
   let leads = [];
+  let currency = ctx.user?.currency || 'INR';
   let search = '';
+  let viewMode = 'kanban'; // kanban | table
+  let quickFilter = 'all'; // all | hot | visits
+  let selectedLeadId = null;
+
+  const STAGES = [
+    { id: 'new', label: 'New Inquiry', pill: 'pill-sky' },
+    { id: 'qualified', label: 'Qualified', pill: 'pill-amber' },
+    { id: 'booked', label: 'Booked / Slot', pill: 'pill-emerald' },
+    { id: 'won', label: 'Won Deals', pill: 'pill-emerald' },
+    { id: 'lost', label: 'Lost', pill: 'pill-rose' }
+  ];
+
+  const sym = () => (currency === 'USD' ? '$' : currency === 'EUR' ? '€' : '₹');
+  const fmtMoney = (n) => `${sym()}${Number(n || 0).toLocaleString('en-IN')}`;
+  const digitsOnly = (s) => String(s || '').replace(/\D/g, '');
 
   async function init() {
-    container.innerHTML = `<div class="card"><span class="card-sub">Loading captured leads...</span></div>`;
+    container.innerHTML = `<div class="card"><span class="card-sub">Loading captured leads CRM...</span></div>`;
     try {
       const res = await api('/api/leads');
       leads = res.leads || [];
+      if (res.currency) currency = res.currency;
       paint();
     } catch (err) {
       toast(err.message, 'err');
@@ -18,76 +35,281 @@ export function renderLeadsView(container, ctx) {
 
   function paint() {
     const filtered = leads.filter((l) => {
+      if (quickFilter === 'hot' && l.score !== 'hot') return false;
+      if (quickFilter === 'visits' && l.stage !== 'booked' && !l.bookedSlot) return false;
       if (!search) return true;
       const q = search.toLowerCase();
-      return (l.name || '').toLowerCase().includes(q) || (l.phone || '').toLowerCase().includes(q) || (l.intent || '').toLowerCase().includes(q);
+      return (
+        (l.name || '').toLowerCase().includes(q) ||
+        (l.phone || '').toLowerCase().includes(q) ||
+        (l.goal || l.intent || '').toLowerCase().includes(q) ||
+        (l.planInterest || '').toLowerCase().includes(q)
+      );
     });
 
+    const pipelineVal = leads.filter((l) => !['won', 'lost'].includes(l.stage)).reduce((a, b) => a + (Number(b.dealValue) || 0), 0);
+    const wonVal = leads.filter((l) => l.stage === 'won').reduce((a, b) => a + (Number(b.dealValue) || 0), 0);
+    const bookedCnt = leads.filter((l) => l.stage === 'booked').length;
+    const hotCnt = leads.filter((l) => l.score === 'hot' && l.stage !== 'lost').length;
+    const activeDrawerLead = leads.find((l) => l._id === selectedLeadId) || null;
+
     container.innerHTML = `
-      <div class="row-between" style="margin-bottom:16px;">
+      <div class="row-between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px;">
         <div>
-          <h2 style="font-size:18px;">Captured Leads CRM</h2>
-          <div class="card-sub">Automatically qualified from WhatsApp buyer inquiries &amp; pricing requests.</div>
+          <h2 style="font-size:18px;">Leads &amp; Revenue CRM</h2>
+          <div class="card-sub">Multi-turn AI capture with slots, executive briefs, and deal attribution.</div>
         </div>
-        <div class="row-gap">
-          <input id="leads-q" class="input" style="width:220px;" placeholder="Filter leads..." value="${escHtml(search)}" />
+        <div class="row-gap" style="flex-wrap:wrap;">
+          <input id="leads-q" class="input" style="width:190px;height:34px;" placeholder="Search name, phone, plan..." value="${escHtml(search)}" />
+          <div class="row-gap">
+            <button class="chip ${viewMode === 'kanban' ? 'active' : ''}" data-vmode="kanban">Kanban</button>
+            <button class="chip ${viewMode === 'table' ? 'active' : ''}" data-vmode="table">Table</button>
+          </div>
           <a href="/api/leads/export.csv" class="btn-3d btn-3d-primary btn-sm">${icon('download', 'icon-sm')}<span>Export CSV</span></a>
         </div>
       </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Customer</th>
-              <th>Phone</th>
-              <th>Intent</th>
-              <th>Budget</th>
-              <th>Score</th>
-              <th>Stage</th>
-              <th>Updated</th>
-              <th style="text-align:right;">Chat</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${filtered.length === 0 ? `
-              <tr><td colspan="8" style="text-align:center;padding:36px;color:var(--ink-muted);">No leads captured yet. High-intent WhatsApp chats automatically appear here.</td></tr>
-            ` : filtered.map((l) => `
-              <tr>
-                <td style="font-weight:500;">${escHtml(l.name)}</td>
-                <td class="mono">${escHtml(l.phone)}</td>
-                <td>${escHtml(l.intent || '—')}</td>
-                <td class="mono">${escHtml(l.budget || '—')}</td>
-                <td>
-                  <span class="pill ${l.score === 'hot' ? 'pill-rose' : l.score === 'warm' ? 'pill-amber' : 'pill-sky'}" style="text-transform:uppercase;font-size:10px;">
-                    ${escHtml(l.score || 'warm')}
-                  </span>
-                </td>
-                <td>
-                  <select class="select lead-stage" data-id="${escHtml(l._id)}" style="height:30px;padding:4px 8px;font-size:12px;">
-                    ${['new', 'contacted', 'converted', 'lost'].map((st) => `<option value="${st}" ${l.stage === st ? 'selected' : ''}>${st}</option>`).join('')}
-                  </select>
-                </td>
-                <td class="tabular muted">${relativeTime(l.updatedAt)} ago</td>
-                <td style="text-align:right;">
-                  <button class="btn-3d btn-3d-secondary btn-sm open-conv" data-cid="${escHtml(l.conversationId || '')}">Open Inbox</button>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+      <div class="crm-kpi-strip">
+        <div class="crm-stat">
+          <div class="crm-stat-label">Active Pipeline</div>
+          <div class="crm-stat-val tabular">${fmtMoney(pipelineVal)}</div>
+        </div>
+        <div class="crm-stat">
+          <div class="crm-stat-label">Closed Won Revenue</div>
+          <div class="crm-stat-val tabular" style="color:var(--emerald);">${fmtMoney(wonVal)}</div>
+        </div>
+        <div class="crm-stat">
+          <div class="crm-stat-label">Visits &amp; Bookings</div>
+          <div class="crm-stat-val tabular">${bookedCnt}</div>
+        </div>
+        <div class="crm-stat">
+          <div class="crm-stat-label">Hot High-Intent</div>
+          <div class="crm-stat-val tabular" style="color:var(--rose);">${hotCnt}</div>
+        </div>
       </div>
+
+      <div class="row-gap" style="margin-bottom:12px;">
+        <button class="chip ${quickFilter === 'all' ? 'active' : ''}" data-qf="all">All Leads (${leads.length})</button>
+        <button class="chip ${quickFilter === 'hot' ? 'active' : ''}" data-qf="hot">Hot Only (${hotCnt})</button>
+        <button class="chip ${quickFilter === 'visits' ? 'active' : ''}" data-qf="visits">Visits &amp; Booked Slots</button>
+      </div>
+
+      ${viewMode === 'kanban' ? `
+        <div class="kanban-board">
+          ${STAGES.map((st) => {
+            const colItems = filtered.filter((l) => (l.stage || 'new') === st.id);
+            const colSum = colItems.reduce((a, b) => a + (Number(b.dealValue) || 0), 0);
+            return `
+              <div class="kanban-col">
+                <div class="kanban-col-head">
+                  <span>${escHtml(st.label)} (${colItems.length})</span>
+                  <span class="mono muted" style="font-size:11px;">${fmtMoney(colSum)}</span>
+                </div>
+                <div class="kanban-cards">
+                  ${colItems.length === 0 ? `<div class="muted" style="font-size:11px;padding:12px 6px;text-align:center;">Empty stage</div>` : colItems.map((l) => `
+                    <div class="kanban-card open-drawer" data-id="${escHtml(l._id)}">
+                      <div class="row-between" style="margin-bottom:4px;">
+                        <span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(l.name)}</span>
+                        <span class="pill ${l.score === 'hot' ? 'pill-rose' : l.score === 'warm' ? 'pill-amber' : 'pill-sky'}" style="font-size:9px;padding:1px 5px;text-transform:uppercase;">${escHtml(l.score || 'warm')}</span>
+                      </div>
+                      <div style="font-size:12px;color:var(--ink-secondary);margin-bottom:5px;line-height:1.35;">${escHtml(l.goal || l.intent || 'Inquiry')}</div>
+                      ${l.bookedSlot ? `<div class="pill pill-emerald" style="font-size:10px;margin-bottom:5px;">Slot: ${escHtml(l.bookedSlot)}</div>` : ''}
+                      <div class="row-between" style="font-size:11px;">
+                        <span class="mono" style="color:var(--emerald);font-weight:500;">${l.dealValue ? fmtMoney(l.dealValue) : (l.budget ? escHtml(l.budget) : '—')}</span>
+                        <span class="muted tabular">${relativeTime(l.updatedAt)}</span>
+                      </div>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      ` : `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Customer</th>
+                <th>Goal &amp; Plan</th>
+                <th>Value</th>
+                <th>Slot</th>
+                <th>Score</th>
+                <th>Stage</th>
+                <th>Updated</th>
+                <th style="text-align:right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.length === 0 ? `
+                <tr><td colspan="8" style="text-align:center;padding:36px;color:var(--ink-muted);">No leads matching filter yet.</td></tr>
+              ` : filtered.map((l) => `
+                <tr>
+                  <td>
+                    <div style="font-weight:500;">${escHtml(l.name)}</div>
+                    <div class="mono muted" style="font-size:11px;">${escHtml(l.phone)}</div>
+                  </td>
+                  <td>
+                    <div>${escHtml(l.goal || l.intent || '—')}</div>
+                    ${l.planInterest ? `<div class="card-sub" style="font-size:11px;">${escHtml(l.planInterest)}</div>` : ''}
+                  </td>
+                  <td class="mono">${l.dealValue ? fmtMoney(l.dealValue) : escHtml(l.budget || '—')}</td>
+                  <td>${l.bookedSlot ? `<span class="pill pill-emerald" style="font-size:11px;">${escHtml(l.bookedSlot)}</span>` : '—'}</td>
+                  <td>
+                    <span class="pill ${l.score === 'hot' ? 'pill-rose' : l.score === 'warm' ? 'pill-amber' : 'pill-sky'}" style="text-transform:uppercase;font-size:10px;">
+                      ${escHtml(l.score || 'warm')}
+                    </span>
+                  </td>
+                  <td>
+                    <select class="select lead-stage" data-id="${escHtml(l._id)}" style="height:30px;padding:4px 8px;font-size:12px;">
+                      ${STAGES.map((st) => `<option value="${st.id}" ${l.stage === st.id ? 'selected' : ''}>${st.label}</option>`).join('')}
+                    </select>
+                  </td>
+                  <td class="tabular muted">${relativeTime(l.updatedAt)}</td>
+                  <td style="text-align:right;">
+                    <div class="row-gap" style="justify-content:flex-end;">
+                      <button class="btn-3d btn-3d-secondary btn-sm open-drawer" data-id="${escHtml(l._id)}">Details</button>
+                      <button class="btn-3d btn-3d-secondary btn-sm open-conv" data-cid="${escHtml(l.conversationId || '')}">Inbox</button>
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      `}
+
+      ${activeDrawerLead ? `
+        <div class="drawer-backdrop" id="lead-drawer-backdrop">
+          <div class="drawer-panel">
+            <div class="row-between" style="margin-bottom:14px;">
+              <div>
+                <h3 style="font-size:17px;">${escHtml(activeDrawerLead.name)}</h3>
+                <div class="mono muted" style="font-size:12px;">${escHtml(activeDrawerLead.phone)}</div>
+              </div>
+              <button id="drawer-close" class="btn-3d btn-3d-secondary btn-sm">&times;</button>
+            </div>
+
+            <div class="row-gap" style="margin-bottom:14px;flex-wrap:wrap;">
+              ${digitsOnly(activeDrawerLead.phone) ? `<a href="tel:+${digitsOnly(activeDrawerLead.phone)}" class="btn-3d btn-3d-secondary btn-sm">${icon('phone', 'icon-sm')}<span>Call</span></a>` : ''}
+              ${digitsOnly(activeDrawerLead.phone) ? `<a href="https://wa.me/${digitsOnly(activeDrawerLead.phone)}" target="_blank" rel="noopener" class="btn-3d btn-3d-secondary btn-sm">WhatsApp Direct</a>` : ''}
+              ${activeDrawerLead.conversationId ? `<button id="drawer-open-inbox" class="btn-3d btn-3d-primary btn-sm">${icon('inbox', 'icon-sm')}<span>Open Chat</span></button>` : ''}
+            </div>
+
+            ${(activeDrawerLead.whyHot || activeDrawerLead.nextStep) ? `
+              <div style="padding:12px;background:var(--bg-inset);border:1px solid var(--border-hairline);border-radius:10px;margin-bottom:14px;">
+                <div style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--emerald);margin-bottom:4px;">AI Executive Brief</div>
+                ${activeDrawerLead.whyHot ? `<div style="font-size:12px;margin-bottom:4px;"><strong>Why Qualified:</strong> ${escHtml(activeDrawerLead.whyHot)}</div>` : ''}
+                ${activeDrawerLead.nextStep ? `<div style="font-size:12px;"><strong>Suggested Next:</strong> ${escHtml(activeDrawerLead.nextStep)}</div>` : ''}
+              </div>
+            ` : ''}
+
+            <form id="drawer-form">
+              <div class="equal-col" style="gap:10px;">
+                <div class="field">
+                  <label>Pipeline Stage</label>
+                  <select id="dr-stage" class="select">
+                    ${STAGES.map((st) => `<option value="${st.id}" ${activeDrawerLead.stage === st.id ? 'selected' : ''}>${st.label}</option>`).join('')}
+                  </select>
+                </div>
+                <div class="field">
+                  <label>Lead Score</label>
+                  <select id="dr-score" class="select">
+                    ${['hot', 'warm', 'cold'].map((sc) => `<option value="${sc}" ${activeDrawerLead.score === sc ? 'selected' : ''}>${sc.toUpperCase()}</option>`).join('')}
+                  </select>
+                </div>
+              </div>
+
+              <div class="field"><label>Primary Need / Goal</label><input id="dr-goal" class="input" value="${escHtml(activeDrawerLead.goal || activeDrawerLead.intent || '')}" /></div>
+              <div class="equal-col" style="gap:10px;">
+                <div class="field"><label>Interested Plan</label><input id="dr-plan" class="input" value="${escHtml(activeDrawerLead.planInterest || '')}" /></div>
+                <div class="field"><label>Deal Value (${sym()})</label><input id="dr-deal" type="number" min="0" class="input mono" value="${Number(activeDrawerLead.dealValue || 0)}" /></div>
+              </div>
+              <div class="field"><label>Booked Visit / Callback Slot</label><input id="dr-slot" class="input" placeholder="e.g. Tomorrow 6 PM" value="${escHtml(activeDrawerLead.bookedSlot || '')}" /></div>
+              <div class="field"><label>Lost Reason (if lost)</label><input id="dr-lost" class="input" placeholder="e.g. Too expensive, joined elsewhere" value="${escHtml(activeDrawerLead.lostReason || '')}" /></div>
+              <div class="field"><label>Team Notes</label><textarea id="dr-notes" class="textarea" rows="3">${escHtml(activeDrawerLead.notes || '')}</textarea></div>
+
+              <div class="row-gap" style="margin-top:8px;">
+                <button type="submit" class="btn-3d btn-3d-primary" style="flex:1;">Save Lead Details</button>
+                ${activeDrawerLead.stage !== 'won' ? `<button type="button" id="dr-mark-won" class="btn-3d btn-3d-secondary">Mark Won (${sym()})</button>` : ''}
+              </div>
+            </form>
+          </div>
+        </div>
+      ` : ''}
     `;
 
     container.querySelector('#leads-q').addEventListener('input', (e) => {
       search = e.target.value;
       paint();
     });
+    container.querySelectorAll('[data-vmode]').forEach((b) => {
+      b.addEventListener('click', () => { viewMode = b.dataset.vmode; paint(); });
+    });
+    container.querySelectorAll('[data-qf]').forEach((b) => {
+      b.addEventListener('click', () => { quickFilter = b.dataset.qf; paint(); });
+    });
+    container.querySelectorAll('.open-drawer').forEach((el) => {
+      el.addEventListener('click', () => { selectedLeadId = el.dataset.id; paint(); });
+    });
+    container.querySelector('#drawer-close')?.addEventListener('click', () => { selectedLeadId = null; paint(); });
+    container.querySelector('#lead-drawer-backdrop')?.addEventListener('click', (e) => {
+      if (e.target.id === 'lead-drawer-backdrop') { selectedLeadId = null; paint(); }
+    });
+    container.querySelector('#drawer-open-inbox')?.addEventListener('click', () => {
+      if (activeDrawerLead?.conversationId) ctx.navigate('inbox', { convId: activeDrawerLead.conversationId });
+    });
+
+    container.querySelector('#drawer-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!activeDrawerLead) return;
+      try {
+        const res = await api(`/api/leads/${encodeURIComponent(activeDrawerLead._id)}`, {
+          method: 'PATCH',
+          body: {
+            stage: container.querySelector('#dr-stage').value,
+            score: container.querySelector('#dr-score').value,
+            goal: container.querySelector('#dr-goal').value,
+            planInterest: container.querySelector('#dr-plan').value,
+            dealValue: Number(container.querySelector('#dr-deal').value || 0),
+            bookedSlot: container.querySelector('#dr-slot').value,
+            lostReason: container.querySelector('#dr-lost').value,
+            notes: container.querySelector('#dr-notes').value
+          }
+        });
+        const idx = leads.findIndex((x) => x._id === activeDrawerLead._id);
+        if (idx >= 0 && res.lead) leads[idx] = res.lead;
+        toast('Lead CRM updated.');
+        selectedLeadId = null;
+        paint();
+      } catch (err) { toast(err.message, 'err'); }
+    });
+
+    container.querySelector('#dr-mark-won')?.addEventListener('click', async () => {
+      if (!activeDrawerLead) return;
+      const dv = Number(container.querySelector('#dr-deal').value || activeDrawerLead.dealValue || 0);
+      try {
+        const res = await api(`/api/leads/${encodeURIComponent(activeDrawerLead._id)}`, {
+          method: 'PATCH',
+          body: { stage: 'won', dealValue: dv }
+        });
+        const idx = leads.findIndex((x) => x._id === activeDrawerLead._id);
+        if (idx >= 0 && res.lead) leads[idx] = res.lead;
+        toast('Marked deal WON!');
+        selectedLeadId = null;
+        paint();
+      } catch (err) { toast(err.message, 'err'); }
+    });
 
     container.querySelectorAll('.lead-stage').forEach((sel) => {
       sel.addEventListener('change', async () => {
-        await api(`/api/leads/${encodeURIComponent(sel.dataset.id)}`, { method: 'PATCH', body: { stage: sel.value } });
-        toast('Lead stage updated.');
+        try {
+          const res = await api(`/api/leads/${encodeURIComponent(sel.dataset.id)}`, { method: 'PATCH', body: { stage: sel.value } });
+          const idx = leads.findIndex((x) => x._id === sel.dataset.id);
+          if (idx >= 0 && res.lead) leads[idx] = res.lead;
+          toast('Lead stage updated.');
+          paint();
+        } catch (err) { toast(err.message, 'err'); }
       });
     });
 

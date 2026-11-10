@@ -15,32 +15,53 @@ export function renderOverviewView(container, ctx) {
     }
   }
 
+  function formatMoney(amt, currency = 'INR') {
+    const sym = currency === 'USD' ? '$' : currency === 'EUR' ? '€' : '₹';
+    return `${sym}${Number(amt || 0).toLocaleString('en-IN')}`;
+  }
+
   function paint(data) {
     const { kpis, quota, series, hourlyTotals, wa } = data;
     const quotaPct = Math.min(100, Math.round(((quota.usedToday || 0) / Math.max(1, quota.maxDailyOut || 90)) * 100));
     const waLive = wa.status === 'open';
+    if (ctx.user) {
+      ctx.user.unseenHumanNeeded = kpis.unseenHumanNeeded || 0;
+      ctx.syncStatusUi?.();
+    }
 
     container.innerHTML = `
+      ${kpis.unseenHumanNeeded > 0 ? `
+        <div class="card" style="margin-bottom:14px;border-color:var(--amber-border);background:var(--amber-tint);padding:12px 16px;">
+          <div class="row-between">
+            <div>
+              <div style="font-weight:600;color:var(--amber);font-size:13px;">${kpis.unseenHumanNeeded} Chat${kpis.unseenHumanNeeded === 1 ? '' : 's'} Left Unseen on WhatsApp for Your Reply</div>
+              <div class="card-sub">Unknown / off-topic questions where AI stayed silent so they stay unread on your phone too.</div>
+            </div>
+            <button id="ov-open-unseen" class="btn-3d btn-3d-secondary btn-sm">Review Waiting Chats</button>
+          </div>
+        </div>
+      ` : ''}
+
       <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Won Revenue</span>${icon('spark', 'icon-sm')}</div>
+          <div class="kpi-value tabular" style="color:var(--emerald);">${formatMoney(kpis.wonRevenue, kpis.currency)}</div>
+          <div class="kpi-foot tabular">${kpis.wonCount || 0} deals won &middot; ${formatMoney(kpis.pipelineValue, kpis.currency)} active pipeline</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Leads &amp; Visits Booked</span>${icon('leads', 'icon-sm')}</div>
+          <div class="kpi-value tabular">${kpis.totalLeads} <span style="font-size:14px;color:var(--ink-muted);font-weight:400;">(${kpis.bookedCount || 0} booked)</span></div>
+          <div class="kpi-foot tabular">${kpis.hotLeadsCount || 0} hot high-intent inquiries</div>
+        </div>
         <div class="kpi-card">
           <div class="kpi-label"><span>Messages (${days}d)</span>${icon('inbox', 'icon-sm')}</div>
           <div class="kpi-value tabular">${kpis.totalIn + kpis.totalAiOut + kpis.totalHumanOut}</div>
-          <div class="kpi-foot tabular">${kpis.totalIn} inbound &middot; ${kpis.totalAiOut} AI &middot; ${kpis.totalHumanOut} manual</div>
+          <div class="kpi-foot tabular">${kpis.totalIn} in &middot; ${kpis.totalAiOut} AI &middot; ${kpis.totalHumanOut} manual</div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-label"><span>AI Resolution Rate</span>${icon('spark', 'icon-sm')}</div>
+          <div class="kpi-label"><span>AI Resolution &amp; Speed</span>${icon('terminal', 'icon-sm')}</div>
           <div class="kpi-value tabular">${kpis.resolutionRate}%</div>
-          <div class="kpi-foot">${kpis.activeChats} threads &middot; ${kpis.pausedChats} paused right now</div>
-        </div>
-        <div class="kpi-card">
-          <div class="kpi-label"><span>Avg Reply Latency</span>${icon('terminal', 'icon-sm')}</div>
-          <div class="kpi-value tabular">${kpis.avgLatencyMs ? `${kpis.avgLatencyMs}ms` : '—'}</div>
-          <div class="kpi-foot">2026 Gemini Flash + OpenRouter</div>
-        </div>
-        <div class="kpi-card">
-          <div class="kpi-label"><span>Leads Captured</span>${icon('leads', 'icon-sm')}</div>
-          <div class="kpi-value tabular">${kpis.totalLeads}</div>
-          <div class="kpi-foot">Extracted automatically from chats</div>
+          <div class="kpi-foot tabular">${kpis.avgLatencyMs ? `${kpis.avgLatencyMs}ms avg` : 'Ready'} &middot; ${kpis.pausedChats} paused</div>
         </div>
       </div>
 
@@ -128,6 +149,7 @@ export function renderOverviewView(container, ctx) {
     });
     container.querySelector('#ov-go-inbox')?.addEventListener('click', () => ctx.navigate('inbox'));
     container.querySelector('#ov-go-brain')?.addEventListener('click', () => ctx.navigate('brain'));
+    container.querySelector('#ov-open-unseen')?.addEventListener('click', () => ctx.navigate('inbox', { filter: 'human_needed' }));
   }
 
   load();

@@ -5,8 +5,10 @@ import {
     ADMIN_PROMPT_TEMPLATES,
     BRAIN_LIMITS,
     CONFIG,
+    LEAD_STAGES,
     WARMUP_PRESETS,
-    createDefaultTenantConfig
+    createDefaultTenantConfig,
+    normalizeLeadStage
 } from './config.mjs';
 import {
     cols,
@@ -14,7 +16,8 @@ import {
     getAuthSecret,
     getStorageTelemetry,
     purgeTenantData,
-    addDays
+    addDays,
+    incrementDailyAnalytics
 } from './db.mjs';
 import {
     CLIENT_COOKIE_NAME,
@@ -329,6 +332,12 @@ export function createApiRouter() {
         if (scope.suspended) return res.json({ authenticated: false, suspended: true });
 
         const snap = waManager.getStatusSnapshot(scope.tenantId);
+        const unseenHumanNeeded = await cols.conversations.countDocuments({
+            tenantId: scope.tenantId,
+            isSandbox: false,
+            aiStatus: 'human_needed'
+        }).catch(() => 0);
+
         return res.json({
             authenticated: true,
             user: {
@@ -340,13 +349,15 @@ export function createApiRouter() {
                 allowClientBrainEdit: scope.tenant.aiConfig?.allowClientBrainEdit !== false,
                 businessName: scope.tenant.botConfig?.businessName || scope.tenant.name,
                 industry: scope.tenant.industry || scope.tenant.botConfig?.industry || '',
+                currency: scope.tenant.botConfig?.currency || 'INR',
                 waPhone: scope.tenant.waPhone || '',
                 waPushName: scope.tenant.waPushName || '',
                 waStatus: snap.status,
                 qrDataUrl: snap.qrDataUrl,
                 pairingCode: snap.pairingCode,
                 circuitReason: snap.circuitReason,
-                aiEnabled: Boolean(scope.tenant.safety?.aiEnabled)
+                aiEnabled: Boolean(scope.tenant.safety?.aiEnabled),
+                unseenHumanNeeded
             }
         });
     });
@@ -805,12 +816,32 @@ export function createApiRouter() {
         const now = new Date();
         const startDate = addDays(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())), -(days - 1));
 
-        const [dailyDocs, activeConvCount, pausedCount, totalLeads] = await Promise.all([
+        const [dailyDocs, activeConvCount, pausedCount, unseenHumanNeeded, allLeads] = await Promise.all([
             cols.analyticsDaily.find({ tenantId, date: { $gte: startDate } }).sort({ date: 1 }).toArray(),
             cols.conversations.countDocuments({ tenantId, isSandbox: false }),
             cols.conversations.countDocuments({ tenantId, isSandbox: false, pausedUntil: { $gt: now } }),
-            cols.leads.countDocuments({ tenantId })
+            cols.conversations.countDocuments({ tenantId, isSandbox: false, aiStatus: 'human_needed' }),
+            cols.leads.find({ tenantId }, { projection: { stage: 1, dealValue: 1, budget: 1, score: 1 } }).toArray()
         ]);
+
+        let pipelineValue = 0;
+        let wonRevenue = 0;
+        let bookedCount = 0;
+        let wonCount = 0;
+        let hotLeadsCount = 0;
+        for (const l of allLeads) {
+            const st = normalizeLeadStage(l.stage);
+            const rawVal = Number(l.dealValue) || Number(String(l.budget || '').replace(/[^0-9.]/g, '')) || 0;
+            if (st === 'won') {
+                wonCount++;
+                wonRevenue += rawVal;
+            } else if (st !== 'lost') {
+                pipelineValue += rawVal;
+                if (st === 'booked') bookedCount++;
+            }
+            if (l.score === 'hot' && st !== 'lost') hotLeadsCount++;
+        }
+        const totalLeads = allLeads.length;
 
         const byDay = new Map(dailyDocs.map((d) => [d.dayKey, d]));
         const series = [];
@@ -865,10 +896,17 @@ export function createApiRouter() {
                 totalAiOut,
                 totalHumanOut,
                 totalLeads,
+                hotLeadsCount,
+                bookedCount,
+                wonCount,
+                pipelineValue: Math.round(pipelineValue),
+                wonRevenue: Math.round(wonRevenue),
+                currency: tenant.botConfig?.currency || 'INR',
                 avgLatencyMs,
                 resolutionRate,
                 activeChats: activeConvCount,
-                pausedChats: pausedCount
+                pausedChats: pausedCount,
+                unseenHumanNeeded
             },
             quota: {
                 usedToday: todayDoc?.aiOutCount || 0,
@@ -939,9 +977,9 @@ export function createApiRouter() {
         ]);
 
         res.json({
-            conversation: { ...conv, contextTurns: undefined, unreadCount: 0 },
+            conversation: { ...conv, contextTurns: undefined, unreadCount: 0, stage: normalizeLeadStage(conv.stage) },
             messages: messages.reverse(),
-            lead: lead || null
+            lead: lead ? { ...lead, stage: normalizeLeadStage(lead.stage) } : null
         });
     });
 
@@ -976,12 +1014,15 @@ export function createApiRouter() {
             const mins = Math.max(5, Math.min(1440, Number(req.body?.minutes || 60)));
             const pausedUntil = new Date(now.getTime() + mins * 60_000);
             sets.aiStatus = 'paused';
+            sets.unseenForOwner = false;
             sets.pausedUntil = pausedUntil;
             sets.pauseReason = 'manual_dashboard';
+            sets.followUpAt = null;
             rt.pausedUntilCache.set(conv.externalRef, { pausedAt: now.getTime(), pausedUntil: pausedUntil.getTime() }, mins * 60_000);
             rt.debouncer?.cleanup(conv.externalRef);
         } else if (req.body?.action === 'resume') {
             sets.aiStatus = 'active';
+            sets.unseenForOwner = false;
             sets.pausedUntil = null;
             sets.pauseReason = '';
             sets.optedOut = false;
@@ -993,9 +1034,13 @@ export function createApiRouter() {
                 { $addToSet: { blacklist: { ref, label: conv.displayName || conv.phoneNumber } } }
             );
             sets.aiStatus = 'manual_resolved';
+            sets.unseenForOwner = false;
+            sets.followUpAt = null;
         }
 
-        if (typeof req.body?.stage === 'string') sets.stage = req.body.stage.slice(0, 32);
+        if (typeof req.body?.stage === 'string') {
+            sets.stage = normalizeLeadStage(req.body.stage);
+        }
         if (typeof req.body?.notes === 'string') sets.notes = req.body.notes.slice(0, 600);
         if (Array.isArray(req.body?.tags)) {
             sets.tags = req.body.tags.map((t) => String(t).trim().slice(0, 24)).filter(Boolean).slice(0, 8);
@@ -1003,6 +1048,12 @@ export function createApiRouter() {
 
         if (Object.keys(sets).length > 0) {
             await cols.conversations.updateOne({ _id: conv._id }, { $set: sets });
+            if (sets.stage) {
+                await cols.leads.updateOne(
+                    { tenantId, contactRef: conv.externalRef },
+                    { $set: { stage: sets.stage, updatedAt: now, ...(sets.stage === 'won' ? { wonAt: now } : {}) } }
+                ).catch(() => {});
+            }
         }
         const updated = await cols.conversations.findOne({ _id: conv._id }, { projection: { contextTurns: 0 } });
         res.json({ ok: true, conversation: updated });
@@ -1029,20 +1080,40 @@ export function createApiRouter() {
         const convId = `${tenantId}:sandbox:preview`;
         const existing = await cols.conversations.findOne({ _id: convId });
         const contextTurns = existing?.contextTurns || [];
+        const customerFacts = existing?.customerFacts || {};
 
         const systemPrompt = buildTenantSystemPrompt(
             tenant,
-            { displayName: 'Preview Customer', phoneNumber: '+91 90000 00000' },
-            text
+            { displayName: customerFacts.name || 'Preview Customer', phoneNumber: '+91 90000 00000' },
+            text,
+            { customerFacts, hasHistory: contextTurns.length > 0 }
         );
         const aiRes = await generateAIReply({
             systemPrompt,
             contextTurns,
             userText: text,
-            aiConfig: tenant.aiConfig
+            aiConfig: tenant.aiConfig,
+            tenant,
+            customerQuery: text,
+            contactContext: { displayName: customerFacts.name || 'Preview Customer', phoneNumber: '+91 90000 00000' },
+            isFollowUp: contextTurns.length > 0
         });
 
+        const nextFacts = { ...customerFacts };
+        if (aiRes.leadData?.name) nextFacts.name = aiRes.leadData.name;
+        if (aiRes.leadData?.goal || aiRes.leadData?.intent) nextFacts.goal = aiRes.leadData.goal || aiRes.leadData.intent;
+        if (aiRes.leadData?.plan) nextFacts.plan = aiRes.leadData.plan;
+        if (aiRes.leadData?.budget) nextFacts.budget = aiRes.leadData.budget;
+        if (aiRes.leadData?.slot) nextFacts.slot = aiRes.leadData.slot;
+
         const now = new Date();
+        const pushTurns = aiRes.isNoReply
+            ? []
+            : [
+                { role: 'user', text: text.slice(0, 600) },
+                { role: 'assistant', text: aiRes.text.slice(0, 600) }
+            ];
+
         await cols.conversations.updateOne(
             { _id: convId },
             {
@@ -1056,23 +1127,25 @@ export function createApiRouter() {
                 },
                 $set: {
                     lastMessageAt: now,
+                    customerFacts: nextFacts,
                     expiresAt: addDays(now, 1)
                 },
-                $push: {
-                    contextTurns: {
-                        $each: [
-                            { role: 'user', text: text.slice(0, 600) },
-                            { role: 'assistant', text: aiRes.text.slice(0, 600) }
-                        ],
-                        $slice: -8
-                    }
-                }
+                ...(pushTurns.length > 0 ? { $push: { contextTurns: { $each: pushTurns, $slice: -10 } } } : {})
             },
             { upsert: true }
         );
 
+        const displayReply = aiRes.isNoReply
+            ? (aiRes.guardrailBlocked
+                ? `[GUARDRAIL BLOCKED · UNSEEN ON WHATSAPP]: ${aiRes.guardrailReason}`
+                : `[NO_REPLY · UNSEEN ON WHATSAPP]: Question unknown/off-topic — kept unread for client team.`)
+            : aiRes.text;
+
         res.json({
-            reply: aiRes.text,
+            reply: displayReply,
+            isNoReply: Boolean(aiRes.isNoReply),
+            guardrailBlocked: Boolean(aiRes.guardrailBlocked),
+            guardrailReason: aiRes.guardrailReason || '',
             model: aiRes.model,
             latencyMs: aiRes.latencyMs,
             leadData: aiRes.leadData,
@@ -1177,7 +1250,14 @@ export function createApiRouter() {
             sendAwayMessage: s.sendAwayMessage !== undefined ? Boolean(s.sendAwayMessage) : Boolean(curr.sendAwayMessage),
             readReceipts: s.readReceipts !== undefined ? Boolean(s.readReceipts) : curr.readReceipts !== false,
             quoteReplies: s.quoteReplies !== undefined ? Boolean(s.quoteReplies) : curr.quoteReplies !== false,
-            splitLongReplies: s.splitLongReplies !== undefined ? Boolean(s.splitLongReplies) : Boolean(curr.splitLongReplies),
+            splitLongReplies: s.splitLongReplies !== undefined ? Boolean(s.splitLongReplies) : curr.splitLongReplies !== false,
+            phaticReactionEnabled: s.phaticReactionEnabled !== undefined ? Boolean(s.phaticReactionEnabled) : curr.phaticReactionEnabled !== false,
+            hotLeadAlertEnabled: s.hotLeadAlertEnabled !== undefined ? Boolean(s.hotLeadAlertEnabled) : curr.hotLeadAlertEnabled !== false,
+            ownerAlertPhone: s.ownerAlertPhone !== undefined ? normalizeDigits(s.ownerAlertPhone).slice(0, 15) : (curr.ownerAlertPhone || ''),
+            dailyDigestEnabled: s.dailyDigestEnabled !== undefined ? Boolean(s.dailyDigestEnabled) : Boolean(curr.dailyDigestEnabled),
+            dailyDigestHour: s.dailyDigestHour !== undefined ? Math.max(8, Math.min(22, Number(s.dailyDigestHour) || 20)) : (curr.dailyDigestHour ?? 20),
+            followUpEnabled: s.followUpEnabled !== undefined ? Boolean(s.followUpEnabled) : Boolean(curr.followUpEnabled),
+            followUpDelayHours: s.followUpDelayHours !== undefined ? Math.max(1, Math.min(24, Number(s.followUpDelayHours) || 4)) : (curr.followUpDelayHours ?? 4),
             voiceNotesEnabled: s.voiceNotesEnabled !== undefined ? Boolean(s.voiceNotesEnabled) : curr.voiceNotesEnabled !== false,
             imageVisionEnabled: s.imageVisionEnabled !== undefined ? Boolean(s.imageVisionEnabled) : curr.imageVisionEnabled !== false,
             optOutKeywords: Array.isArray(s.optOutKeywords)
@@ -1213,44 +1293,89 @@ export function createApiRouter() {
         res.json({ ok: true, safety: nextSafety, blacklist });
     });
 
-    // Leads & CSV Export
+    // Leads CRM & CSV Export
     router.get('/api/leads', requireClient, async (req, res) => {
-        const leads = await cols.leads
+        const rawLeads = await cols.leads
             .find({ tenantId: req.scope.tenantId })
             .sort({ updatedAt: -1 })
-            .limit(200)
+            .limit(300)
             .toArray();
-        res.json({ leads });
+        const leads = rawLeads.map((l) => ({
+            ...l,
+            stage: normalizeLeadStage(l.stage),
+            dealValue: Number(l.dealValue) || Number(String(l.budget || '').replace(/[^0-9.]/g, '')) || 0,
+            goal: l.goal || l.intent || 'General Inquiry'
+        }));
+        res.json({ leads, currency: req.scope.tenant.botConfig?.currency || 'INR' });
     });
 
     router.patch('/api/leads/:id', requireClient, async (req, res) => {
         const tenantId = req.scope.tenantId;
-        const sets = { updatedAt: new Date() };
-        if (['new', 'contacted', 'converted', 'lost'].includes(req.body?.stage)) sets.stage = req.body.stage;
-        if (['hot', 'warm', 'cold'].includes(req.body?.score)) sets.score = req.body.score;
-        if (typeof req.body?.intent === 'string') sets.intent = req.body.intent.trim().slice(0, 120);
-
         if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Invalid lead ID.' });
-        const result = await cols.leads.updateOne(
-            { _id: new ObjectId(req.params.id), tenantId },
-            { $set: sets }
-        );
-        if (result.matchedCount === 0) return res.status(404).json({ error: 'Lead not found.' });
-        res.json({ ok: true });
+        const leadObjId = new ObjectId(req.params.id);
+        const existing = await cols.leads.findOne({ _id: leadObjId, tenantId });
+        if (!existing) return res.status(404).json({ error: 'Lead not found.' });
+
+        const now = new Date();
+        const sets = { updatedAt: now };
+        if (req.body?.stage !== undefined) {
+            const st = normalizeLeadStage(req.body.stage);
+            sets.stage = st;
+            if (st === 'won' && !existing.wonAt) sets.wonAt = now;
+        }
+        if (['hot', 'warm', 'cold'].includes(req.body?.score)) sets.score = req.body.score;
+        if (typeof req.body?.name === 'string' && req.body.name.trim()) sets.name = req.body.name.trim().slice(0, 80);
+        if (typeof req.body?.intent === 'string') {
+            sets.intent = req.body.intent.trim().slice(0, 120);
+            sets.goal = sets.intent;
+        }
+        if (typeof req.body?.goal === 'string') {
+            sets.goal = req.body.goal.trim().slice(0, 140);
+            sets.intent = sets.goal.slice(0, 120);
+        }
+        if (typeof req.body?.planInterest === 'string') sets.planInterest = req.body.planInterest.trim().slice(0, 80);
+        if (req.body?.dealValue !== undefined) {
+            const dv = Number(String(req.body.dealValue).replace(/[^0-9.]/g, ''));
+            sets.dealValue = Number.isFinite(dv) && dv >= 0 ? Math.round(dv) : 0;
+        }
+        if (typeof req.body?.budget === 'string') sets.budget = req.body.budget.trim().slice(0, 60);
+        if (typeof req.body?.bookedSlot === 'string') sets.bookedSlot = req.body.bookedSlot.trim().slice(0, 80);
+        if (typeof req.body?.bookedAttended === 'boolean') sets.bookedAttended = req.body.bookedAttended;
+        if (typeof req.body?.lostReason === 'string') sets.lostReason = req.body.lostReason.trim().slice(0, 160);
+        if (typeof req.body?.notes === 'string') sets.notes = req.body.notes.trim().slice(0, 600);
+        if (typeof req.body?.nextStep === 'string') sets.nextStep = req.body.nextStep.trim().slice(0, 140);
+
+        await cols.leads.updateOne({ _id: leadObjId, tenantId }, { $set: sets });
+
+        // Sync CRM stage cleanly back to Inbox conversation
+        if (sets.stage && existing.conversationId) {
+            await cols.conversations.updateOne(
+                { _id: existing.conversationId, tenantId },
+                { $set: { stage: sets.stage } }
+            ).catch(() => {});
+        }
+        const updated = await cols.leads.findOne({ _id: leadObjId, tenantId });
+        res.json({ ok: true, lead: { ...updated, stage: normalizeLeadStage(updated?.stage) } });
     });
 
     router.get('/api/leads/export.csv', requireClient, async (req, res) => {
         const leads = await cols.leads.find({ tenantId: req.scope.tenantId }).sort({ createdAt: -1 }).toArray();
         const esc = (v) => `"${String(v || '').replace(/"/g, '""')}"`;
-        const lines = ['Name,Phone,Intent,Budget,Score,Stage,CapturedAt'];
+        const lines = ['Name,Phone,Stage,Score,DealValue,Budget,Goal,Plan,BookedSlot,WhyHot,NextStep,Notes,CapturedAt'];
         for (const l of leads) {
             lines.push([
                 esc(l.name),
                 esc(l.phone),
-                esc(l.intent),
-                esc(l.budget),
+                esc(normalizeLeadStage(l.stage)),
                 esc(l.score),
-                esc(l.stage),
+                esc(l.dealValue || 0),
+                esc(l.budget),
+                esc(l.goal || l.intent),
+                esc(l.planInterest || ''),
+                esc(l.bookedSlot || ''),
+                esc(l.whyHot || ''),
+                esc(l.nextStep || ''),
+                esc(l.notes || ''),
                 esc(new Date(l.createdAt).toISOString())
             ].join(','));
         }
@@ -1316,11 +1441,13 @@ export function createApiRouter() {
         if (!tenant) return res.status(404).json({ error: 'Tenant not found or suspended' });
 
         const aiRes = await generateAIReply({
-            systemPrompt: buildTenantSystemPrompt(tenant),
+            systemPrompt: buildTenantSystemPrompt(tenant, null, String(text)),
             contextTurns: [],
-            userText: String(text)
+            userText: String(text),
+            tenant,
+            customerQuery: String(text)
         });
-        return res.json({ reply: aiRes.text, model: aiRes.model, latencyMs: aiRes.latencyMs });
+        return res.json({ reply: aiRes.text, isNoReply: Boolean(aiRes.isNoReply), model: aiRes.model, latencyMs: aiRes.latencyMs });
     });
 
     return router;

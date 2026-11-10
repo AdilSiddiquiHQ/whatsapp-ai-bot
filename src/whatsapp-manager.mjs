@@ -3,17 +3,20 @@ import makeWASocket, {
     fetchLatestWaWebVersion,
     Browsers,
     jidNormalizedUser,
+    areJidsSameUser,
+    normalizeMessageContent,
     initAuthCreds,
     BufferJSON,
     proto,
     makeCacheableSignalKeyStore,
     downloadMediaMessage,
     generateMessageIDV2,
-    WAMessageStatus
+    WAMessageStatus,
+    WAMessageStubType
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
-import { CONFIG } from './config.mjs';
+import { CONFIG, normalizeLeadStage } from './config.mjs';
 import { BoundedCacheStore, SlidingWindowLimiter } from './cache.mjs';
 import { authStateCache } from './security.mjs';
 import {
@@ -25,6 +28,12 @@ import {
 } from './db.mjs';
 import { eventBus } from './stream.mjs';
 import { buildTenantSystemPrompt, generateAIReply } from './ai-engine.mjs';
+import {
+    isAutoresponderMessage,
+    detectPromptInjection,
+    isClosurePhatic,
+    classifyStopIntent
+} from './guardrails.mjs';
 
 const silentLogger = pino({ level: 'silent' });
 const BROWSER_PROFILES = [
@@ -73,20 +82,76 @@ class HumanMath {
 }
 
 class HumanTypingSimulator {
-    static getReadDwell() {
-        return HumanMath.clamp(HumanMath.logNormal(1200, 0.35), 700, 2400);
+    static getReadDwell(text = '') {
+        if (String(text || '').trim().length < 18) {
+            return HumanMath.clamp(HumanMath.normal(380, 70), 250, 550);
+        }
+        return HumanMath.clamp(HumanMath.logNormal(850, 0.3), 500, 1500);
     }
-    static getThinkingDelay(text) {
-        const chars = (text || '').trim().length;
-        const reading = chars * HumanMath.normal(38, 7);
-        const formulation = HumanMath.logNormal(1400, 0.35);
-        return HumanMath.clamp(reading + formulation, 900, 3800);
-    }
-    static getTypingDuration(replyText) {
+    static getTypingDuration(replyText, isFollowUpBubble = false) {
         const chars = (replyText || '').length;
-        const dur = chars * 13 + HumanMath.normal(200, 80);
-        return HumanMath.clamp(dur, 1000, 3200);
+        if (isFollowUpBubble) {
+            return HumanMath.clamp(chars * 14 + HumanMath.normal(140, 40), 700, 1550);
+        }
+        const dur = chars * 13 + HumanMath.normal(180, 60);
+        return HumanMath.clamp(dur, 850, 2600);
     }
+}
+
+export function calculateAdaptiveDebounceMs(textBody, hasAudio, hasImage, baseDebounceMs = 1800) {
+    if (hasAudio || hasImage) return 3000;
+    const trimmed = String(textBody || '').trim();
+    if (!trimmed) return Math.min(3500, Math.max(1200, baseDebounceMs));
+
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    const lower = trimmed.toLowerCase();
+    const isShortOpener = /^(hi+|hello+|hey+|heylo|hola|yo|good\s*(?:morning|afternoon|evening)|namaste|haan?ji|bhai+|bro|sir|ma'?am|mam|sun|suno)[.!\s]*$/i.test(lower);
+    if (isShortOpener || (words.length <= 2 && !trimmed.includes('?'))) {
+        return 4200;
+    }
+    if (/[.,…]$/.test(trimmed) || /\b(aur|and|or|also|plus|wait|ek sec|ruko)\s*$/i.test(lower)) {
+        return 3400;
+    }
+    if (trimmed.includes('?') || words.length >= 8) {
+        return Math.min(2200, Math.max(1500, baseDebounceMs));
+    }
+    return Math.min(3000, Math.max(1800, baseDebounceMs));
+}
+
+export function shouldQuoteInboundMessage({ peer, items, lastItem, batchEnqueuedAt, quoteSetting }) {
+    if (quoteSetting === false || quoteSetting === 'never') return null;
+    if (quoteSetting === 'always') return lastItem?.msg || null;
+    if (peer?.isGroup) return lastItem?.msg || null;
+    if (Array.isArray(items) && items.length >= 3) return lastItem?.msg || null;
+    if (batchEnqueuedAt && Date.now() - batchEnqueuedAt > 30_000) return lastItem?.msg || null;
+    return null;
+}
+
+export function splitHumanBubbles(rawText, splitEnabled = true) {
+    const text = String(rawText || '').trim();
+    if (!splitEnabled || text.length < 75) return [text];
+
+    // Keep bulleted/numbered summaries unified in one clean bubble
+    if (/^(\s*[-*•]|\s*\d+\.)/m.test(text)) {
+        return [text];
+    }
+
+    // Split Answer Bubble + Standalone Closing Question Hook Bubble
+    const qMatch = text.match(/^([\s\S]{25,}?)(?:\n+|[.!]\s+)([A-Za-z0-9*'"₹$€£,%()/+\-\s]{10,135}\?[\s*]*)$/);
+    if (qMatch) {
+        const b1 = qMatch[1].trim();
+        const b2 = qMatch[2].trim();
+        if (b1.length >= 25 && b2.length >= 10) {
+            return [b1, b2];
+        }
+    }
+
+    if (text.includes('\n\n') && text.length > 180) {
+        const paras = text.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+        if (paras.length >= 2 && paras.length <= 3) return paras;
+    }
+
+    return [text];
 }
 
 class TenantDebouncer {
@@ -94,12 +159,13 @@ class TenantDebouncer {
         this.buffers = new Map();
         this.onBatch = onBatch;
     }
-    enqueue(canonicalRef, item, idleMs = 1800, maxWaitMs = 5500) {
+    enqueue(canonicalRef, item, idleMs = 1800, maxWaitMs = 8000) {
         let entry = this.buffers.get(canonicalRef);
         if (!entry) {
             entry = {
                 items: [],
                 enqueuedAt: Date.now(),
+                maxWaitMs,
                 idleTimer: null,
                 maxWaitTimer: null
             };
@@ -109,6 +175,43 @@ class TenantDebouncer {
         entry.items.push(item);
         if (entry.idleTimer) clearTimeout(entry.idleTimer);
         entry.idleTimer = setTimeout(() => this.flush(canonicalRef), idleMs);
+    }
+    revokeMessage(canonicalRef, targetMsgId) {
+        if (!targetMsgId) return false;
+        const entry = this.buffers.get(canonicalRef);
+        if (!entry) return false;
+        const prevLen = entry.items.length;
+        entry.items = entry.items.filter((it) => it.msg?.key?.id !== targetMsgId);
+        if (entry.items.length === 0) {
+            this.cleanup(canonicalRef);
+            return prevLen > 0;
+        }
+        return entry.items.length < prevLen;
+    }
+    editMessage(canonicalRef, targetMsgId, newText) {
+        if (!targetMsgId) return false;
+        const entry = this.buffers.get(canonicalRef);
+        if (!entry) return false;
+        const target = entry.items.find((it) => it.msg?.key?.id === targetMsgId);
+        if (!target) return false;
+        target.textBody = newText;
+        if (entry.idleTimer) clearTimeout(entry.idleTimer);
+        entry.idleTimer = setTimeout(() => this.flush(canonicalRef), 1500);
+        return true;
+    }
+    extendForPresence(canonicalRef, presenceState) {
+        const entry = this.buffers.get(canonicalRef);
+        if (!entry) return;
+        if (presenceState === 'composing' || presenceState === 'recording') {
+            const remainingMax = entry.maxWaitMs - (Date.now() - entry.enqueuedAt);
+            if (remainingMax > 1000) {
+                if (entry.idleTimer) clearTimeout(entry.idleTimer);
+                entry.idleTimer = setTimeout(() => this.flush(canonicalRef), Math.min(2400, remainingMax));
+            }
+        } else if (presenceState === 'paused' || presenceState === 'available') {
+            if (entry.idleTimer) clearTimeout(entry.idleTimer);
+            entry.idleTimer = setTimeout(() => this.flush(canonicalRef), 900);
+        }
     }
     flush(canonicalRef) {
         const entry = this.buffers.get(canonicalRef);
@@ -360,6 +463,7 @@ class WhatsAppTenantManager {
         this.runtimes = new Map();
         this.connectLock = Promise.resolve();
         this.isShuttingDown = false;
+        this.sweeperTimer = null;
     }
 
     getRuntime(tenantId) {
@@ -439,6 +543,13 @@ class WhatsAppTenantManager {
                 }
             }
         })();
+
+        // Start 5-minute singleton revival & daily digest cursor sweep
+        if (this.sweeperTimer) clearInterval(this.sweeperTimer);
+        this.sweeperTimer = setInterval(() => {
+            this._runBackgroundSweep().catch(() => {});
+        }, 5 * 60_000);
+        this.sweeperTimer.unref?.();
     }
 
     async connectTenant(tenantId, { forceFresh = false } = {}) {
@@ -677,8 +788,9 @@ class WhatsAppTenantManager {
                 }
             });
 
-            // Monitor delivery NACKs (463 Reachout Timelock / 429)
+            // Monitor delivery NACKs (463 / 429) AND live message edits/revokes
             sock.ev.on('messages.update', async (updates) => {
+                if (rt.sock !== sock) return;
                 for (const u of updates || []) {
                     const status = u.update?.status;
                     const stubParams = u.update?.messageStubParameters || [];
@@ -695,6 +807,47 @@ class WhatsAppTenantManager {
                             eventBus.emitTenant(tenantId, 'wa_status', this.getStatusSnapshot(tenantId));
                         }
                     }
+
+                    // Handle message revocations or edits delivered via messages.update
+                    if (u.update?.messageStubType === WAMessageStubType.REVOKE || u.update?.message === null) {
+                        const targetId = u.key?.id;
+                        const peerRef = u.key?.remoteJid ? this._resolvePeerIdentity(rt, { key: u.key }).canonicalRef : '';
+                        if (targetId && peerRef) {
+                            rt.debouncer?.revokeMessage(peerRef, targetId);
+                            await cols.messages.updateOne(
+                                { waMsgId: targetId, tenantId },
+                                { $set: { text: '[Message deleted]', isDeleted: true } }
+                            ).catch(() => {});
+                        }
+                    } else if (u.update?.message?.editedMessage) {
+                        const inner = normalizeMessageContent(u.update.message.editedMessage);
+                        const editText = (inner?.conversation || inner?.extendedTextMessage?.text || '').trim();
+                        const targetId = u.key?.id;
+                        const peerRef = u.key?.remoteJid ? this._resolvePeerIdentity(rt, { key: u.key }).canonicalRef : '';
+                        if (targetId && editText && peerRef) {
+                            rt.debouncer?.editMessage(peerRef, targetId, editText);
+                            await cols.messages.updateOne(
+                                { waMsgId: targetId, tenantId },
+                                { $set: { text: editText.slice(0, 2500), isEdited: true } }
+                            ).catch(() => {});
+                        }
+                    }
+                }
+            });
+
+            // Coordinate adaptive debounce while customer is actively typing/recording
+            sock.ev.on('presence.update', ({ id, presences }) => {
+                if (rt.sock !== sock || !id) return;
+                const normJid = jidNormalizedUser(id);
+                let canonicalRef = normJid;
+                if (normJid.endsWith('@s.whatsapp.net')) {
+                    canonicalRef = normalizeDigits(normJid.split('@')[0]);
+                } else if (normJid.endsWith('@lid')) {
+                    canonicalRef = rt.lidToPn.get(normJid) || normJid;
+                }
+                const presenceObj = presences?.[id] || presences?.[normJid] || (presences ? Object.values(presences)[0] : null);
+                if (presenceObj?.lastKnownPresence) {
+                    rt.debouncer?.extendForPresence(canonicalRef, presenceObj.lastKnownPresence);
                 }
             });
 
@@ -833,17 +986,256 @@ class WhatsAppTenantManager {
         return { remoteJid, isGroup: false, canonicalRef, phoneNumber, lidJid };
     }
 
+    _extractNormalizedPayload(rawMsg) {
+        const raw = rawMsg?.message;
+        if (!raw) return { type: 'empty', text: '' };
+
+        // 1. Check protocol messages BEFORE unwrapping envelopes (REVOKE / MESSAGE_EDIT)
+        if (raw.protocolMessage) {
+            const pType = raw.protocolMessage.type;
+            if (pType === 0) {
+                return { type: 'revoke', targetId: raw.protocolMessage.key?.id || '' };
+            }
+            if (pType === 14) {
+                const inner = normalizeMessageContent(raw.protocolMessage.editedMessage);
+                const editText = (
+                    inner?.conversation ||
+                    inner?.extendedTextMessage?.text ||
+                    inner?.imageMessage?.caption ||
+                    inner?.videoMessage?.caption ||
+                    ''
+                ).trim();
+                return { type: 'edit', targetId: raw.protocolMessage.key?.id || '', text: editText };
+            }
+            return { type: 'protocol_sync', text: '' };
+        }
+        if (raw.senderKeyDistributionMessage) {
+            return { type: 'protocol_sync', text: '' };
+        }
+
+        // 2. Unwrap Disappearing (ephemeralMessage), View-Once & Edited wrappers cleanly
+        const m = normalizeMessageContent(raw);
+        if (!m) return { type: 'empty', text: '' };
+
+        // Ignore passive reaction emojis & stickers (never invoke LLM)
+        if (m.reactionMessage || m.stickerMessage) {
+            return { type: 'noise', text: '' };
+        }
+
+        // 3. Extract quoted reply context if customer replied to an earlier message
+        const ctxInfo =
+            m.extendedTextMessage?.contextInfo ||
+            m.imageMessage?.contextInfo ||
+            m.videoMessage?.contextInfo ||
+            m.audioMessage?.contextInfo ||
+            m.documentMessage?.contextInfo ||
+            m.buttonsResponseMessage?.contextInfo ||
+            m.listResponseMessage?.contextInfo ||
+            null;
+
+        let quotedSummary = '';
+        if (ctxInfo?.quotedMessage) {
+            const qm = normalizeMessageContent(ctxInfo.quotedMessage);
+            if (qm) {
+                const qt = (
+                    qm.conversation ||
+                    qm.extendedTextMessage?.text ||
+                    qm.imageMessage?.caption ||
+                    qm.videoMessage?.caption ||
+                    qm.documentMessage?.caption ||
+                    ''
+                ).trim();
+                if (qt) quotedSummary = qt.slice(0, 260);
+                else if (qm.imageMessage) quotedSummary = '[Earlier Photo]';
+                else if (qm.audioMessage) quotedSummary = '[Earlier Voice Note]';
+            }
+        }
+
+        const mentionedJid = ctxInfo?.mentionedJid || [];
+        const ctxParticipant = ctxInfo?.participant || '';
+
+        // 4. Media / Location / Contact / Text resolution
+        if (m.audioMessage) {
+            return {
+                type: 'audio',
+                text: '',
+                mime: m.audioMessage.mimetype || 'audio/ogg',
+                size: Number(m.audioMessage.fileLength || 0),
+                seconds: Number(m.audioMessage.seconds || 0),
+                quotedSummary,
+                mentionedJid,
+                ctxParticipant
+            };
+        }
+
+        if (m.imageMessage) {
+            return {
+                type: 'image',
+                text: (m.imageMessage.caption || '').trim(),
+                mime: m.imageMessage.mimetype || 'image/jpeg',
+                size: Number(m.imageMessage.fileLength || 0),
+                quotedSummary,
+                mentionedJid,
+                ctxParticipant
+            };
+        }
+
+        if (m.locationMessage || m.liveLocationMessage) {
+            const loc = m.locationMessage || m.liveLocationMessage;
+            const label = [loc.name, loc.address].filter(Boolean).join(', ');
+            const locText = `[Customer shared location: ${loc.degreesLatitude}, ${loc.degreesLongitude}${label ? ` (${label})` : ''} - https://maps.google.com/?q=${loc.degreesLatitude},${loc.degreesLongitude}]`;
+            return { type: 'location', text: locText, quotedSummary, mentionedJid, ctxParticipant };
+        }
+
+        if (m.contactMessage || m.contactsArrayMessage) {
+            const list = m.contactsArrayMessage?.contacts || [m.contactMessage];
+            const summary = list
+                .filter(Boolean)
+                .map((c) => {
+                    const telM = (c.vcard || '').match(/waid=(\d+)/i) || (c.vcard || '').match(/TEL[^:]*:([^\r\n]+)/i);
+                    const phone = telM ? telM[1].replace(/[^\d+]/g, '') : '';
+                    return `${c.displayName || 'Contact'}${phone ? ` (${phone})` : ''}`;
+                })
+                .join(', ');
+            return { type: 'contact', text: `[Customer shared contact: ${summary}]`, quotedSummary, mentionedJid, ctxParticipant };
+        }
+
+        const text = (
+            m.conversation ||
+            m.extendedTextMessage?.text ||
+            m.videoMessage?.caption ||
+            m.documentMessage?.caption ||
+            m.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+            m.buttonsResponseMessage?.selectedDisplayText ||
+            m.listResponseMessage?.title ||
+            m.templateButtonReplyMessage?.selectedDisplayText ||
+            ''
+        ).trim();
+
+        return {
+            type: text ? 'text' : 'empty',
+            text,
+            quotedSummary,
+            mentionedJid,
+            ctxParticipant
+        };
+    }
+
+    async _markUnseenForOwner(tenantId, rt, tenant, convId, convDoc, peer, canonicalRef, reasonTag, logDetail, quarantinedReply = null) {
+        const hNow = new Date();
+        const hMins = Number(tenant.safety?.takeoverMinutes ?? 30);
+        const hPauseUntil = hMins === 0 ? addDays(hNow, 3650) : new Date(hNow.getTime() + hMins * 60_000);
+        rt.pausedUntilCache.set(
+            canonicalRef,
+            { pausedAt: hNow.getTime(), pausedUntil: hPauseUntil.getTime() },
+            Math.max(hMins, 60) * 60_000
+        );
+
+        await cols.conversations.updateOne(
+            { _id: convId },
+            {
+                $set: {
+                    aiStatus: 'human_needed',
+                    unseenForOwner: true,
+                    pausedUntil: hPauseUntil,
+                    pauseReason: reasonTag,
+                    followUpAt: null
+                },
+                $max: { unreadCount: 1 }
+            }
+        ).catch(() => {});
+
+        eventBus.emitTenant(tenantId, 'inbox_msg', {
+            conversationId: convId,
+            aiStatus: 'human_needed',
+            unseenForOwner: true,
+            pauseReason: reasonTag,
+            pausedUntil: hPauseUntil.toISOString()
+        });
+
+        await this.logAndEmit(
+            tenantId,
+            'warn',
+            'takeover',
+            `[Unseen · Needs Team] Kept ${convDoc?.displayName || peer.phoneNumber} (${peer.phoneNumber}) unread on WhatsApp & Dashboard — ${logDetail}.`,
+            quarantinedReply ? { reason: reasonTag, blockedDraft: quarantinedReply.slice(0, 260) } : { reason: reasonTag }
+        );
+
+        if (tenant.safety?.webhookUrl) {
+            fetch(tenant.safety.webhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    event: 'human_needed',
+                    tenantId,
+                    phone: convDoc?.phoneNumber || peer.phoneNumber,
+                    name: convDoc?.displayName || peer.phoneNumber,
+                    reason: reasonTag,
+                    timestamp: hNow.toISOString()
+                })
+            }).catch(() => {});
+        }
+    }
+
+    async _sendOwnerAlert(tenantId, rt, tenant, text) {
+        if (!rt?.sock || rt.status !== 'open' || !text) return false;
+        const customDigits = normalizeDigits(tenant?.safety?.ownerAlertPhone || '');
+        const meJid = rt.sock.user?.id ? jidNormalizedUser(rt.sock.user.id) : '';
+        const targetJid = customDigits.length >= 10 ? `${customDigits}@s.whatsapp.net` : meJid;
+        if (!targetJid) return false;
+
+        try {
+            const msgId = generateMessageIDV2(rt.sock.user?.id);
+            rt.botSentIds.set(msgId, true);
+            rt.sentProtoBuffer.set(msgId, { conversation: text });
+            await rt.sock.sendMessage(targetJid, { text }, { messageId: msgId });
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     async _handleUpsertMessage(tenantId, rt, sock, msg, type) {
         try {
             if (!msg.message) return;
             const jid = msg.key.remoteJid;
             if (!jid || jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
 
-            // Skip internal Baileys protocol / encryption sync payloads
-            if (msg.message.protocolMessage || msg.message.senderKeyDistributionMessage) return;
+            // Skip Note-to-Self traffic cleanly so Owner Alerts never create fake customer chats or loops
+            const mePnJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : '';
+            const meLidJid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : '';
+            const isSelfChat = (mePnJid && areJidsSameUser(jid, mePnJid)) || (meLidJid && areJidsSameUser(jid, meLidJid));
+            if (isSelfChat) return;
+
+            const payload = this._extractNormalizedPayload(msg);
+            if (payload.type === 'protocol_sync' || payload.type === 'noise') return;
 
             const tenant = await cols.tenants.findOne({ _id: tenantId });
             if (!tenant || tenant.status !== 'active') return;
+
+            const peer = this._resolvePeerIdentity(rt, msg);
+
+            // Handle live message deletions & edits mid-debounce
+            if (payload.type === 'revoke') {
+                rt.debouncer?.revokeMessage(peer.canonicalRef, payload.targetId);
+                if (payload.targetId) {
+                    await cols.messages.updateOne(
+                        { waMsgId: payload.targetId, tenantId },
+                        { $set: { text: '[Message deleted]', isDeleted: true } }
+                    ).catch(() => {});
+                }
+                return;
+            }
+            if (payload.type === 'edit') {
+                if (payload.targetId && payload.text) {
+                    rt.debouncer?.editMessage(peer.canonicalRef, payload.targetId, payload.text);
+                    await cols.messages.updateOne(
+                        { waMsgId: payload.targetId, tenantId },
+                        { $set: { text: payload.text.slice(0, 2500), isEdited: true } }
+                    ).catch(() => {});
+                }
+                return;
+            }
 
             const isFromMe = Boolean(msg.key.fromMe);
             const msgTsMs = (Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000;
@@ -852,31 +1244,23 @@ class WhatsAppTenantManager {
             if (isFromMe) {
                 const isRecent = Date.now() - msgTsMs < 120_000 && msgTsMs >= rt.bootTimeMs - 15_000;
                 if (type !== 'notify' && !isRecent) return;
-
-                // Did our bot send this message? Checked via pre-registered IDs!
                 if (rt.botSentIds.has(msg.key.id)) return;
-
-                const peer = this._resolvePeerIdentity(rt, msg);
                 if (peer.isGroup) return;
 
-                const extractedText = this._extractPreviewText(msg) || '[Attachment]';
+                const extractedText = payload.text || '[Attachment]';
                 await this._handleManualOwnerEcho(tenantId, rt, tenant, peer, extractedText, msg.key.id);
                 return;
             }
 
             if (type !== 'notify') return;
 
-            const peer = this._resolvePeerIdentity(rt, msg);
             if (peer.isGroup) {
                 const groupMode = tenant.safety?.groupMode || 'ignore_all';
                 if (groupMode === 'ignore_all') return;
 
-                const rawText = this._extractPreviewText(msg);
-                const botPnJid = jidNormalizedUser(sock.user?.id || '');
-                const mentioned = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
-                const isMentioned = mentioned.some((m) => jidNormalizedUser(m) === botPnJid);
-                const isQuotedBot = jidNormalizedUser(msg.message.extendedTextMessage?.contextInfo?.participant || '') === botPnJid;
-                const hasPrefix = rawText.startsWith('!ai') || rawText.startsWith('/ask');
+                const isMentioned = payload.mentionedJid.some((mj) => mePnJid && jidNormalizedUser(mj) === mePnJid);
+                const isQuotedBot = Boolean(payload.ctxParticipant && mePnJid && jidNormalizedUser(payload.ctxParticipant) === mePnJid);
+                const hasPrefix = payload.text.startsWith('!ai') || payload.text.startsWith('/ask');
                 if (!isMentioned && !isQuotedBot && !hasPrefix) return;
             }
 
@@ -887,23 +1271,26 @@ class WhatsAppTenantManager {
                 return;
             }
 
-            // Extract message content & optional ephemeral media attachment
-            const textBody = this._extractPreviewText(msg);
-            const hasAudio = Boolean(msg.message.audioMessage);
-            const hasImage = Boolean(msg.message.imageMessage);
+            const rawTextBody = payload.text || '';
+            const textBody = payload.quotedSummary && rawTextBody
+                ? `[Replying to: "${payload.quotedSummary}"]\n${rawTextBody}`
+                : rawTextBody;
+            const hasAudio = payload.type === 'audio';
+            const hasImage = payload.type === 'image';
 
             if (!textBody && !hasAudio && !hasImage) return;
 
             let mediaTypeTag = 'text';
             if (hasAudio) mediaTypeTag = 'audio';
             else if (hasImage) mediaTypeTag = 'image';
+            else if (payload.type === 'location') mediaTypeTag = 'location';
+            else if (payload.type === 'contact') mediaTypeTag = 'contact';
 
             const convId = `${tenantId}:wa:${peer.canonicalRef}`;
             const now = new Date();
             const safePushName = msg.pushName && msg.pushName !== '~' ? msg.pushName.trim().slice(0, 80) : '';
-            const previewLabel = textBody || (hasAudio ? '[Voice Note]' : '[Image]');
+            const previewLabel = rawTextBody || (hasAudio ? '[Voice Note]' : '[Image]');
 
-            // Upsert conversation (lookup LID/PN seamless updates without clobbering manual tags)
             const setFields = {
                 tenantId,
                 channel: 'wa',
@@ -912,6 +1299,7 @@ class WhatsAppTenantManager {
                 isSandbox: false,
                 lastMessagePreview: previewLabel.slice(0, 120),
                 lastMessageAt: now,
+                followUpAt: null,
                 expiresAt: addDays(now, 180)
             };
             if (peer.phoneNumber && peer.phoneNumber !== 'WhatsApp User') setFields.phoneNumber = peer.phoneNumber;
@@ -931,8 +1319,9 @@ class WhatsAppTenantManager {
                     stage: 'new',
                     tags: [],
                     notes: '',
-                    unreadCount: 1,
+                    customerFacts: {},
                     contextTurns: [],
+                    unreadCount: 1,
                     createdAt: now
                 }).catch(() => {});
             } else {
@@ -970,25 +1359,43 @@ class WhatsAppTenantManager {
                 }
             });
 
-            // Check Opt-Out / Opt-In keywords before scheduling AI
-            const cleanCmd = textBody.trim().toLowerCase();
-            const optOutList = tenant.safety?.optOutKeywords || ['stop', 'stopall', 'unsubscribe'];
-            const optOutRegex = new RegExp(`^(${optOutList.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})[.!\\s]*$`, 'i');
+            // Inbound Autoresponder Loop Shield (stops bot-to-bot ping-pong at $0 cost!)
+            if (rawTextBody && isAutoresponderMessage(rawTextBody)) {
+                await cols.conversations.updateOne(
+                    { _id: convId },
+                    { $set: { aiStatus: 'bot_loop_detected', pausedUntil: addDays(now, 1), pauseReason: 'autoresponder_shield' } }
+                ).catch(() => {});
+                await this.logAndEmit(tenantId, 'warn', 'safety', `Autoresponder loop detected from ${peer.phoneNumber}. AI paused 24h & left unseen.`);
+                return;
+            }
 
-            if (cleanCmd && optOutRegex.test(cleanCmd) && !convDoc?.optedOut) {
-                await cols.conversations.updateOne({ _id: convId }, { $set: { optedOut: true, aiStatus: 'paused' } });
+            // Inbound Prompt Injection Defense
+            if (rawTextBody && detectPromptInjection(rawTextBody)) {
+                await this._markUnseenForOwner(tenantId, rt, tenant, convId, convDoc, peer, peer.canonicalRef, 'prompt_injection_flag', 'prompt injection attempt blocked');
+                return;
+            }
+
+            // Contextual Opt-Out vs Human-Agent Escalation Classifier ("wait stop" won't shut down bot!)
+            const stopIntent = classifyStopIntent(rawTextBody, tenant.safety?.optOutKeywords);
+            if (stopIntent === 'opt_out' && !convDoc?.optedOut) {
+                await cols.conversations.updateOne({ _id: convId }, { $set: { optedOut: true, aiStatus: 'paused', followUpAt: null } });
                 const optMsgId = generateMessageIDV2(sock.user?.id);
                 rt.botSentIds.set(optMsgId, true);
-                const byeText = 'Automated AI replies are now paused for this chat. A human team member can still reply, or type *START* anytime to re-enable.';
+                const byeText = 'Automated AI replies are paused for this chat. Our team can still assist you directly, or type *START* anytime to re-enable.';
                 await sock.sendMessage(peer.remoteJid, { text: byeText }, { messageId: optMsgId }).catch(() => {});
                 await this._recordBotMessage(tenantId, convId, byeText, 'system-optout', 0, optMsgId);
-                await this.logAndEmit(tenantId, 'info', 'safety', `Customer ${peer.phoneNumber} opted out via "${textBody}".`);
+                await this.logAndEmit(tenantId, 'info', 'safety', `Customer ${peer.phoneNumber} opted out via "${rawTextBody}".`);
+                return;
+            }
+
+            if (stopIntent === 'human_request') {
+                await this._markUnseenForOwner(tenantId, rt, tenant, convId, convDoc, peer, peer.canonicalRef, 'customer_requested_human', 'customer asked to speak with a human');
                 return;
             }
 
             if (convDoc?.optedOut) {
-                if (/^(start|resume|subscribe)[.!\s]*$/i.test(cleanCmd)) {
-                    await cols.conversations.updateOne({ _id: convId }, { $set: { optedOut: false, aiStatus: 'active', pausedUntil: null } });
+                if (/^(start|resume|subscribe)[.!\s]*$/i.test(rawTextBody.trim())) {
+                    await cols.conversations.updateOne({ _id: convId }, { $set: { optedOut: false, aiStatus: 'active', pausedUntil: null, unseenForOwner: false } });
                     await this.logAndEmit(tenantId, 'info', 'safety', `Customer ${peer.phoneNumber} re-subscribed via START.`);
                 } else {
                     return;
@@ -1006,7 +1413,6 @@ class WhatsAppTenantManager {
                 return;
             }
 
-            // Global Circuit Breaker check
             if (rt.circuitBreakerUntil > nowMs) return;
 
             // Business hours / operating mode gate
@@ -1031,13 +1437,29 @@ class WhatsAppTenantManager {
                 return;
             }
 
-            // Enqueue into debouncer to merge burst messages seamlessly
-            const debounceMs = Math.min(8000, Math.max(400, Number(tenant.safety?.debounceMs || 1800)));
+            // Subscribe to live typing presence so debouncer waits if customer is typing message #2!
+            sock.presenceSubscribe(peer.remoteJid).catch(() => {});
+
+            const baseDebounceMs = Math.min(8000, Math.max(400, Number(tenant.safety?.debounceMs || 1800)));
+            const adaptiveDebounceMs = calculateAdaptiveDebounceMs(rawTextBody, hasAudio, hasImage, baseDebounceMs);
+
             rt.debouncer.enqueue(
                 peer.canonicalRef,
-                { msg, peer, convId, textBody, hasAudio, hasImage, safePushName },
-                debounceMs,
-                6000
+                {
+                    msg,
+                    peer,
+                    convId,
+                    textBody,
+                    rawTextBody,
+                    hasAudio,
+                    hasImage,
+                    audioSeconds: payload.seconds || 0,
+                    audioSize: payload.size || 0,
+                    safePushName,
+                    senderParticipant: msg.key.participant || peer.remoteJid
+                },
+                adaptiveDebounceMs,
+                8000
             );
         } catch (err) {
             await this.logAndEmit(tenantId, 'err', 'wa', `Inbound handling error: ${err.message}`);
@@ -1050,7 +1472,6 @@ class WhatsAppTenantManager {
         const nowMs = now.getTime();
         const pausedUntil = takeoverMins === 0 ? addDays(now, 3650) : new Date(nowMs + takeoverMins * 60_000);
 
-        // Cancel pending AI debounce and flag in-flight queue immediately!
         rt.debouncer?.cleanup(peer.canonicalRef);
         rt.pausedUntilCache.set(peer.canonicalRef, { pausedAt: nowMs, pausedUntil: pausedUntil.getTime() }, Math.max(takeoverMins, 60) * 60_000);
 
@@ -1070,13 +1491,16 @@ class WhatsAppTenantManager {
                     stage: 'new',
                     tags: [],
                     notes: '',
+                    customerFacts: {},
                     contextTurns: [],
                     createdAt: now
                 },
                 $set: {
                     aiStatus: 'paused',
+                    unseenForOwner: false,
                     pausedUntil,
                     pauseReason: 'owner_app',
+                    followUpAt: null,
                     unreadCount: 0,
                     lastMessagePreview: `You: ${text.slice(0, 100)}`,
                     lastMessageAt: now,
@@ -1085,7 +1509,7 @@ class WhatsAppTenantManager {
                 $push: {
                     contextTurns: {
                         $each: [{ role: 'assistant', text: `[Human Agent]: ${text.slice(0, 600)}` }],
-                        $slice: -8
+                        $slice: -10
                     }
                 }
             },
@@ -1110,6 +1534,7 @@ class WhatsAppTenantManager {
         eventBus.emitTenant(tenantId, 'inbox_msg', {
             conversationId: convId,
             aiStatus: 'paused',
+            unseenForOwner: false,
             pausedUntil: pausedUntil.toISOString(),
             message: { ...ownerMsg, createdAt: now.toISOString() }
         });
@@ -1156,20 +1581,58 @@ class WhatsAppTenantManager {
             return;
         }
 
-        // Ephemeral media download (RAM only, discarded immediately after Gemini call!)
-        let mediaAttachment = null;
+        const mergedText = items
+            .map((i) => i.textBody || (i.hasAudio ? '[Voice Note]' : '[Image]'))
+            .filter(Boolean)
+            .join('\n');
+
+        // 1. Closure Phatic Fast Path ("Ok", "Thanks", "Done", "👍"): react with 👍 at $0 LLM cost!
+        if (!items.some((i) => i.hasAudio || i.hasImage) && isClosurePhatic(mergedText, convDoc.contextTurns)) {
+            if (tenant.safety?.phaticReactionEnabled !== false) {
+                await HumanMath.sleep(450);
+                if (tenant.safety?.readReceipts !== false && lastItem.msg?.key) {
+                    await sock.readMessages([lastItem.msg.key]).catch(() => {});
+                }
+                await sock.sendMessage(peer.remoteJid, {
+                    react: { text: '👍', key: lastItem.msg.key }
+                }).catch(() => {});
+                await cols.conversations.updateOne(
+                    { _id: convId },
+                    { $set: { unreadCount: 0, unseenForOwner: false, lastMessagePreview: 'Reacted 👍' } }
+                ).catch(() => {});
+                await this.logAndEmit(tenantId, 'info', 'ai', `Reacted 👍 to closing acknowledgment from ${convDoc.displayName || peer.phoneNumber} (0 LLM calls).`);
+                eventBus.emitTenant(tenantId, 'inbox_msg', { conversationId: convId });
+            }
+            return;
+        }
+
+        // 2. Audio Duration Pre-Flight Gates
         const mediaItem = [...items].reverse().find((it) => (it.hasAudio && tenant.safety?.voiceNotesEnabled) || (it.hasImage && tenant.safety?.imageVisionEnabled));
+        if (mediaItem?.hasAudio && !lastItem.rawTextBody) {
+            if ((mediaItem.audioSeconds > 0 && mediaItem.audioSeconds < 1) || (mediaItem.audioSize > 0 && mediaItem.audioSize < 900)) {
+                await this.logAndEmit(tenantId, 'info', 'ai', `Skipped empty <1s voice tap from ${peer.phoneNumber}.`);
+                return;
+            }
+            if (mediaItem.audioSeconds > 90) {
+                await this._markUnseenForOwner(tenantId, rt, tenant, convId, convDoc, peer, canonicalRef, 'long_voice_note', `long voice note (${mediaItem.audioSeconds}s) held for human`);
+                return;
+            }
+        }
+
+        // 3. Ephemeral media download from unwrapped envelope (RAM only — never saved to MongoDB!)
+        let mediaAttachment = null;
         if (mediaItem) {
             try {
                 const m = mediaItem.msg;
-                const fileSize = Number(m.message?.audioMessage?.fileLength || m.message?.imageMessage?.fileLength || 0);
+                const inner = normalizeMessageContent(m.message);
+                const fileSize = Number(inner?.audioMessage?.fileLength || inner?.imageMessage?.fileLength || 0);
                 if (fileSize <= 4_500_000) {
                     const buf = await downloadMediaMessage(m, 'buffer', {}, {
                         logger: silentLogger,
                         reuploadRequest: sock.updateMediaMessage
                     });
                     if (Buffer.isBuffer(buf) && buf.length > 0 && buf.length <= 4_500_000) {
-                        const rawMime = m.message?.audioMessage?.mimetype || m.message?.imageMessage?.mimetype || '';
+                        const rawMime = inner?.audioMessage?.mimetype || inner?.imageMessage?.mimetype || '';
                         const cleanMime = rawMime.split(';')[0].trim() || (mediaItem.hasAudio ? 'audio/ogg' : 'image/jpeg');
                         mediaAttachment = {
                             type: mediaItem.hasAudio ? 'audio' : 'image',
@@ -1181,63 +1644,91 @@ class WhatsAppTenantManager {
             } catch {}
         }
 
-        const mergedText = items
-            .map((i) => i.textBody || (i.hasAudio ? '[Voice Note]' : '[Image]'))
-            .filter(Boolean)
-            .join('\n');
-
-        // Read dwell & read receipt
-        await HumanMath.sleep(HumanTypingSimulator.getReadDwell());
-        if (tenant.safety?.readReceipts !== false) {
-            const keys = items.map((i) => i.msg.key).filter(Boolean);
-            if (keys.length > 0) await sock.readMessages(keys).catch(() => {});
-        }
-
-        await HumanMath.sleep(HumanTypingSimulator.getThinkingDelay(mergedText));
-
-        // Double check no owner takeover started while reading/thinking!
-        const recheckPause = rt.pausedUntilCache.get(canonicalRef);
-        if (recheckPause && (recheckPause.pausedAt > batchEnqueuedAt || recheckPause.pausedUntil > Date.now())) {
-            return;
-        }
-
+        const llmStartedMs = Date.now();
+        const existingLead = await cols.leads.findOne({ tenantId, contactRef: peer.canonicalRef }).catch(() => null);
         const systemPrompt = buildTenantSystemPrompt(
             tenant,
             { displayName: convDoc.displayName, phoneNumber: convDoc.phoneNumber },
-            mergedText
+            mergedText,
+            {
+                knownLead: existingLead,
+                customerFacts: convDoc.customerFacts || {},
+                hasHistory: Array.isArray(convDoc.contextTurns) && convDoc.contextTurns.length > 0
+            }
         );
 
+        // 4. Run AI + Guardrails IMMEDIATELY BEFORE calling readMessages (preserves unseen state on [NO_REPLY]!)
         const aiRes = await generateAIReply({
             systemPrompt,
             contextTurns: convDoc.contextTurns || [],
             userText: mergedText,
             mediaAttachment,
-            aiConfig: tenant.aiConfig
+            aiConfig: tenant.aiConfig,
+            tenant,
+            customerQuery: mergedText,
+            contactContext: { displayName: convDoc.displayName, phoneNumber: convDoc.phoneNumber },
+            isFollowUp: Array.isArray(convDoc.contextTurns) && convDoc.contextTurns.length > 0
         });
-        mediaAttachment = null; // Free RAM immediately
+        mediaAttachment = null;
 
-        // Final check before typing & sending!
+        // Check if owner manually jumped in while LLM ran
+        const postPause = rt.pausedUntilCache.get(canonicalRef);
+        if (postPause && (postPause.pausedAt > batchEnqueuedAt || postPause.pausedUntil > Date.now())) {
+            return;
+        }
+        if (rt.sock !== sock || rt.status !== 'open') return;
+
+        // 5. SILENT ABSTENTION (Unknown / Off-topic / Guardrail Blocked):
+        //    Do NOT call sock.readMessages() & do NOT reply -> keeps green unread badge (1) on client WhatsApp phone + logs & flags Dashboard!
+        if (aiRes.isNoReply || !aiRes.text) {
+            const reasonTag = aiRes.guardrailBlocked
+                ? `guardrail:${aiRes.guardrailReason}`
+                : (aiRes.handoffData?.reason || 'unknown_or_offtopic_unseen');
+            const detail = aiRes.guardrailBlocked
+                ? `blocked unverified draft (${aiRes.guardrailReason})`
+                : `unknown or off-topic query (${aiRes.guardrailReason || 'no_reply'})`;
+            await this._markUnseenForOwner(tenantId, rt, tenant, convId, convDoc, peer, canonicalRef, reasonTag, detail, aiRes.quarantinedText || null);
+            return;
+        }
+
+        // 6. CONFIRMED REPLY PATH: Complete remaining read dwell, then emit Blue Ticks!
+        const targetDwell = HumanTypingSimulator.getReadDwell(mergedText);
+        const remainingDwell = Math.max(0, targetDwell - (Date.now() - llmStartedMs));
+        if (remainingDwell > 0) await HumanMath.sleep(remainingDwell);
+
+        if (tenant.safety?.readReceipts !== false) {
+            const keys = items.map((i) => i.msg.key).filter(Boolean);
+            if (keys.length > 0) await sock.readMessages(keys).catch(() => {});
+        }
+        await HumanMath.sleep(HumanMath.clamp(HumanMath.normal(320, 70), 220, 520));
+
+        // Final abort check before typing presence & send
         const finalPause = rt.pausedUntilCache.get(canonicalRef);
         if (finalPause && (finalPause.pausedAt > batchEnqueuedAt || finalPause.pausedUntil > Date.now())) {
             return;
         }
         if (rt.sock !== sock || rt.status !== 'open') return;
 
-        // Split long multi-paragraph replies naturally if opted in
-        const chunks = tenant.safety?.splitLongReplies && aiRes.text.length > 220 && aiRes.text.includes('\n\n')
-            ? aiRes.text.split('\n\n').map((s) => s.trim()).filter(Boolean).slice(0, 3)
-            : [aiRes.text];
-
-        const quoteMsg = tenant.safety?.quoteReplies !== false ? lastItem.msg : null;
+        const chunks = splitHumanBubbles(aiRes.text, tenant.safety?.splitLongReplies !== false);
+        const quoteMsg = shouldQuoteInboundMessage({
+            peer,
+            items,
+            lastItem,
+            batchEnqueuedAt,
+            quoteSetting: tenant.safety?.quoteReplies
+        });
         let lastSentId = '';
 
         for (let idx = 0; idx < chunks.length; idx++) {
             const chunk = chunks[idx];
-            const typingMs = HumanTypingSimulator.getTypingDuration(chunk);
+            if (idx > 0) {
+                await HumanMath.sleep(HumanMath.clamp(HumanMath.normal(520, 80), 350, 800));
+            }
+            const typingMs = HumanTypingSimulator.getTypingDuration(chunk, idx > 0);
             await sock.sendPresenceUpdate('composing', peer.remoteJid).catch(() => {});
-            await HumanMath.sleep(idx === 0 ? typingMs : Math.min(1800, typingMs));
+            await HumanMath.sleep(typingMs);
             await sock.sendPresenceUpdate('paused', peer.remoteJid).catch(() => {});
-            await HumanMath.sleep(180);
+            await HumanMath.sleep(120);
 
             const msgId = generateMessageIDV2(sock.user?.id);
             rt.botSentIds.set(msgId, true);
@@ -1246,28 +1737,65 @@ class WhatsAppTenantManager {
             const opts = { messageId: msgId };
             if (idx === 0 && quoteMsg?.message) opts.quoted = quoteMsg;
             rt.sentProtoBuffer.set(msgId, { conversation: chunk });
-            await sock.sendMessage(peer.remoteJid, { text: chunk }, opts);
+
+            const sendPayload = { text: chunk };
+            if (peer.isGroup && lastItem.senderParticipant) {
+                sendPayload.mentions = [lastItem.senderParticipant];
+            }
+            await sock.sendMessage(peer.remoteJid, sendPayload, opts);
         }
 
         rt.hourlyCounter.count++;
 
-        // Update bounded AI context turns (max 8) + metrics
+        // Build durable customerFacts & concise voice-summary memory
+        const now = new Date();
+        const nextFacts = { ...(convDoc.customerFacts || {}) };
+        if (aiRes.leadData?.name) nextFacts.name = aiRes.leadData.name;
+        if (aiRes.leadData?.goal || aiRes.leadData?.intent) nextFacts.goal = aiRes.leadData.goal || aiRes.leadData.intent;
+        if (aiRes.leadData?.plan) nextFacts.plan = aiRes.leadData.plan;
+        if (aiRes.leadData?.budget) nextFacts.budget = aiRes.leadData.budget;
+        if (aiRes.leadData?.slot) nextFacts.slot = aiRes.leadData.slot;
+
+        const userTurnText = aiRes.voiceIntent
+            ? `[Voice Note]: ${aiRes.voiceIntent}`
+            : mergedText.slice(0, 600);
+
+        const nextStatus = aiRes.handoffData ? 'human_needed' : 'active';
+        let nextFollowUpAt = null;
+        if (
+            !aiRes.handoffData &&
+            tenant.safety?.followUpEnabled &&
+            !convDoc.followUpSentAt &&
+            !nextFacts.slot &&
+            existingLead?.stage !== 'booked' &&
+            existingLead?.stage !== 'won' &&
+            existingLead?.stage !== 'lost'
+        ) {
+            const delayHrs = Math.max(1, Math.min(24, Number(tenant.safety?.followUpDelayHours || 4)));
+            nextFollowUpAt = new Date(now.getTime() + delayHrs * 3600_000);
+        }
+
         await cols.conversations.updateOne(
             { _id: convId },
             {
                 $set: {
+                    aiStatus: nextStatus,
+                    unseenForOwner: Boolean(aiRes.handoffData),
                     lastMessagePreview: aiRes.text.slice(0, 120),
-                    lastMessageAt: new Date(),
+                    lastMessageAt: now,
                     unreadCount: 0,
-                    expiresAt: addDays(new Date(), 180)
+                    customerFacts: nextFacts,
+                    ...(nextFacts.name ? { displayName: nextFacts.name } : {}),
+                    followUpAt: nextFollowUpAt,
+                    expiresAt: addDays(now, 180)
                 },
                 $push: {
                     contextTurns: {
                         $each: [
-                            { role: 'user', text: mergedText.slice(0, 600) },
+                            { role: 'user', text: userTurnText },
                             { role: 'assistant', text: aiRes.text.slice(0, 600) }
                         ],
-                        $slice: -8
+                        $slice: -10
                     }
                 }
             }
@@ -1285,20 +1813,19 @@ class WhatsAppTenantManager {
             tenantId,
             aiRes.isError ? 'warn' : 'info',
             'ai',
-            `Replied to ${convDoc.displayName || peer.phoneNumber} (${peer.phoneNumber}) via ${aiRes.model} in ${aiRes.latencyMs}ms.`
+            `Replied to ${nextFacts.name || convDoc.displayName || peer.phoneNumber} (${peer.phoneNumber}) via ${aiRes.model} in ${aiRes.latencyMs}ms.`
         );
 
-        // Capture Lead if AI spotted high-intent signal
+        // Capture/Enrich Rich Lead + Instant Deduplicated Owner Alert
         if (aiRes.leadData) {
-            await this._upsertLead(tenantId, tenant, convDoc, aiRes.leadData, tz);
+            await this._upsertLead(tenantId, rt, tenant, { ...convDoc, displayName: nextFacts.name || convDoc.displayName }, aiRes.leadData, tz);
         }
 
-        // Flag conversation for human team when AI hits unknown knowledge or escalation
+        // Pause AI after clean mid-conversation bridge handoff so human team takes over smoothly
         if (aiRes.handoffData) {
-            const hNow = new Date();
             const hMins = Number(tenant.safety?.takeoverMinutes ?? 30);
-            const hPauseUntil = hMins === 0 ? addDays(hNow, 3650) : new Date(hNow.getTime() + hMins * 60_000);
-            rt.pausedUntilCache.set(canonicalRef, { pausedAt: hNow.getTime(), pausedUntil: hPauseUntil.getTime() }, Math.max(hMins, 60) * 60_000);
+            const hPauseUntil = hMins === 0 ? addDays(now, 3650) : new Date(now.getTime() + hMins * 60_000);
+            rt.pausedUntilCache.set(canonicalRef, { pausedAt: now.getTime(), pausedUntil: hPauseUntil.getTime() }, Math.max(hMins, 60) * 60_000);
 
             await cols.conversations.updateOne(
                 { _id: convId },
@@ -1323,22 +1850,6 @@ class WhatsAppTenantManager {
                 'takeover',
                 `AI escalated ${convDoc.displayName || peer.phoneNumber} to human team (${aiRes.handoffData.reason}).`
             );
-
-            if (tenant.safety?.webhookUrl) {
-                fetch(tenant.safety.webhookUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        event: 'human_needed',
-                        tenantId,
-                        phone: convDoc.phoneNumber,
-                        name: convDoc.displayName,
-                        reason: aiRes.handoffData.reason,
-                        lastQuestion: mergedText,
-                        timestamp: hNow.toISOString()
-                    })
-                }).catch(() => {});
-            }
         }
     }
 
@@ -1365,15 +1876,32 @@ class WhatsAppTenantManager {
         });
     }
 
-    async _upsertLead(tenantId, tenant, convDoc, leadData, tz) {
+    async _upsertLead(tenantId, rt, tenant, convDoc, leadData, tz) {
         const now = new Date();
         const existing = await cols.leads.findOne({ tenantId, contactRef: convDoc.externalRef });
+        const existingStage = normalizeLeadStage(existing?.stage || 'new');
+        let nextStage = existingStage;
+
+        if (leadData.slot && !['won', 'lost'].includes(existingStage)) {
+            nextStage = 'booked';
+        } else if (existingStage === 'new' && (leadData.score === 'hot' || leadData.plan || leadData.budget || leadData.dealValue)) {
+            nextStage = 'qualified';
+        }
+
+        const resolvedDealVal = Number(leadData.dealValue) || existing?.dealValue || 0;
         const setFields = {
-            name: convDoc.displayName || convDoc.phoneNumber,
+            name: leadData.name || existing?.name || convDoc.displayName || convDoc.phoneNumber,
             phone: convDoc.phoneNumber,
-            intent: leadData.intent || existing?.intent || 'General Inquiry',
-            budget: leadData.budget || existing?.budget || '',
+            goal: leadData.goal || leadData.intent || existing?.goal || existing?.intent || 'General Inquiry',
+            intent: leadData.intent || leadData.goal || existing?.intent || 'General Inquiry',
+            planInterest: leadData.plan || existing?.planInterest || '',
+            dealValue: resolvedDealVal,
+            budget: leadData.budget || existing?.budget || (resolvedDealVal ? String(resolvedDealVal) : ''),
+            bookedSlot: leadData.slot || existing?.bookedSlot || '',
+            whyHot: leadData.why || existing?.whyHot || '',
+            nextStep: leadData.next || existing?.nextStep || '',
             score: leadData.score || existing?.score || 'warm',
+            stage: nextStage,
             conversationId: convDoc._id,
             updatedAt: now
         };
@@ -1385,7 +1913,6 @@ class WhatsAppTenantManager {
                     tenantId,
                     channel: 'wa',
                     contactRef: convDoc.externalRef,
-                    stage: 'new',
                     createdAt: now
                 },
                 $set: setFields
@@ -1397,7 +1924,33 @@ class WhatsAppTenantManager {
             await incrementDailyAnalytics(tenantId, tz, { leadsCount: 1 });
         }
 
-        await this.logAndEmit(tenantId, 'info', 'ai', `Captured ${setFields.score.toUpperCase()} lead: ${setFields.name} (${setFields.intent}).`);
+        await this.logAndEmit(tenantId, 'info', 'ai', `Captured ${setFields.score.toUpperCase()} lead [${nextStage.toUpperCase()}]: ${setFields.name} (${setFields.goal}).`);
+
+        // Deduplicated WhatsApp Owner Alert (max 1 per Hot Lead + 1 per new Booking Slot!)
+        if (tenant.safety?.hotLeadAlertEnabled !== false) {
+            const isNewHot = setFields.score === 'hot' && !existing?.hotAlertSentAt;
+            const isNewBooking = Boolean(setFields.bookedSlot && setFields.bookedSlot !== existing?.lastAlertedSlot);
+            if (isNewHot || isNewBooking) {
+                const headline = isNewBooking ? '📅 NEW VISIT / BOOKING LOCKED' : '🔥 HOT LEAD ALERT';
+                const alertLines = [
+                    headline,
+                    `Name: ${setFields.name} (${setFields.phone})`,
+                    `Need: ${setFields.goal}`,
+                    setFields.planInterest || setFields.budget ? `Plan/Value: ${[setFields.planInterest, setFields.budget ? `₹${setFields.budget}` : ''].filter(Boolean).join(' · ')}` : '',
+                    setFields.bookedSlot ? `Slot: ${setFields.bookedSlot}` : '',
+                    setFields.whyHot ? `Why: ${setFields.whyHot}` : '',
+                    setFields.nextStep ? `Next: ${setFields.nextStep}` : ''
+                ].filter(Boolean).join('\n');
+
+                const sentOk = await this._sendOwnerAlert(tenantId, rt, tenant, alertLines);
+                if (sentOk) {
+                    const alertSet = {};
+                    if (isNewHot) alertSet.hotAlertSentAt = now;
+                    if (isNewBooking) alertSet.lastAlertedSlot = setFields.bookedSlot;
+                    await cols.leads.updateOne({ tenantId, contactRef: convDoc.externalRef }, { $set: alertSet }).catch(() => {});
+                }
+            }
+        }
 
         if (tenant.safety?.webhookUrl && setFields.score === 'hot') {
             fetch(tenant.safety.webhookUrl, {
@@ -1405,6 +1958,109 @@ class WhatsAppTenantManager {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ event: 'hot_lead', tenantId, lead: setFields, timestamp: now.toISOString() })
             }).catch(() => {});
+        }
+    }
+
+    async _runBackgroundSweep() {
+        if (!cols.tenants || !cols.conversations || this.isShuttingDown) return;
+        const now = new Date();
+        const minus2h = new Date(now.getTime() - 2 * 3600_000);
+        const minus24h = new Date(now.getTime() - 24 * 3600_000);
+
+        for (const [tenantId, rt] of this.runtimes.entries()) {
+            if (this.isShuttingDown || !rt.sock || rt.status !== 'open' || rt.circuitBreakerUntil > Date.now()) continue;
+
+            const tenant = await cols.tenants.findOne({ _id: tenantId }).catch(() => null);
+            if (!tenant || tenant.status !== 'active' || !tenant.safety?.aiEnabled) continue;
+
+            const tz = tenant.safety?.timezone || 'Asia/Kolkata';
+            const { dayKey, hourKey } = getLocalDayAndHour(now, tz);
+            const curHourNum = Number(hourKey);
+
+            // 1. Optional Daily Evening Owner Summary (Note-to-Self / Owner Phone)
+            const digestHour = Number(tenant.safety?.dailyDigestHour ?? 20);
+            if (tenant.safety?.dailyDigestEnabled && curHourNum >= digestHour && tenant.lastDigestDayKey !== dayKey) {
+                const claimed = await cols.tenants.updateOne(
+                    { _id: tenantId, lastDigestDayKey: { $ne: dayKey } },
+                    { $set: { lastDigestDayKey: dayKey } }
+                ).catch(() => null);
+
+                if (claimed?.modifiedCount === 1) {
+                    const [dailyStat, unseenCnt, bookedToday] = await Promise.all([
+                        cols.analyticsDaily.findOne({ _id: `${tenantId}:${dayKey}` }).catch(() => null),
+                        cols.conversations.countDocuments({ tenantId, isSandbox: false, aiStatus: 'human_needed' }).catch(() => 0),
+                        cols.leads.countDocuments({ tenantId, stage: 'booked', updatedAt: { $gte: minus24h } }).catch(() => 0)
+                    ]);
+                    const digestMsg = [
+                        `📊 *Daily WhatsApp Summary (${tenant.name})*`,
+                        `Messages In: ${dailyStat?.inCount || 0} | AI Replies: ${dailyStat?.aiOutCount || 0}`,
+                        `New Leads Today: ${dailyStat?.leadsCount || 0} | Booked Visits: ${bookedToday}`,
+                        unseenCnt > 0 ? `Waiting for You (Unseen): ${unseenCnt} chats` : 'All caught up — zero chats waiting!'
+                    ].join('\n');
+                    await this._sendOwnerAlert(tenantId, rt, tenant, digestMsg);
+                }
+            }
+
+            // 2. Safe 1-Shot Ghosted-Inquiry Revival Sweeper (Business Hours + Safety Capped)
+            if (!tenant.safety?.followUpEnabled) continue;
+            const hrsCheck = isWithinOperatingWindow(tenant.safety);
+            if (!hrsCheck.aiAllowed) continue;
+
+            const dailyStats = await cols.analyticsDaily.findOne({ _id: `${tenantId}:${dayKey}` }).catch(() => null);
+            const maxDaily = tenant.safety?.maxDailyOut || 90;
+            if ((dailyStats?.aiOutCount || 0) >= maxDaily) continue;
+
+            const dueConvs = await cols.conversations
+                .find({
+                    tenantId,
+                    isSandbox: false,
+                    optedOut: { $ne: true },
+                    aiStatus: 'active',
+                    lastMessageAt: { $gte: minus24h, $lte: minus2h },
+                    followUpAt: { $ne: null, $lte: now },
+                    followUpSentAt: null
+                })
+                .limit(5)
+                .toArray()
+                .catch(() => []);
+
+            for (const conv of dueConvs) {
+                if (conv.pausedUntil && new Date(conv.pausedUntil).getTime() > now.getTime()) continue;
+
+                // Atomic one-shot lock prevents duplicate follow-ups across restarts
+                const lock = await cols.conversations.updateOne(
+                    { _id: conv._id, followUpSentAt: null },
+                    { $set: { followUpAt: null, followUpSentAt: now } }
+                ).catch(() => null);
+                if (lock?.matchedCount !== 1) continue;
+
+                const prompt = buildTenantSystemPrompt(
+                    tenant,
+                    { displayName: conv.displayName, phoneNumber: conv.phoneNumber },
+                    conv.lastMessagePreview || '',
+                    { customerFacts: conv.customerFacts || {}, hasHistory: true }
+                );
+                const nudgeRes = await generateAIReply({
+                    systemPrompt: prompt,
+                    contextTurns: conv.contextTurns || [],
+                    userText: '[INTERNAL SYSTEM: The customer asked about our service a few hours ago and went quiet. Write 1 ultra-short, warm, zero-pressure follow-up line (max 15 words) checking if they need slot help. NEVER invent prices/discounts. Output [NO_REPLY] if previous exchange was not an inquiry.]',
+                    tenant,
+                    contactContext: { displayName: conv.displayName, phoneNumber: conv.phoneNumber },
+                    isFollowUp: true,
+                    strictGrounding: true
+                });
+
+                if (nudgeRes.isNoReply || !nudgeRes.text) continue;
+
+                const targetJid = conv.remoteJid || `${conv.externalRef}@s.whatsapp.net`;
+                const msgId = generateMessageIDV2(rt.sock.user?.id);
+                rt.botSentIds.set(msgId, true);
+                rt.sentProtoBuffer.set(msgId, { conversation: nudgeRes.text });
+                await rt.sock.sendMessage(targetJid, { text: nudgeRes.text }, { messageId: msgId }).catch(() => {});
+                await this._recordBotMessage(tenantId, conv._id, nudgeRes.text, `${nudgeRes.model}-revival`, nudgeRes.latencyMs, msgId);
+                await incrementDailyAnalytics(tenantId, tz, { aiOutCount: 1 });
+                await this.logAndEmit(tenantId, 'info', 'ai', `Sent 1-shot gentle revival follow-up to ${conv.displayName || conv.phoneNumber}.`);
+            }
         }
     }
 
@@ -1434,8 +2090,10 @@ class WhatsAppTenantManager {
             {
                 $set: {
                     aiStatus: 'paused',
+                    unseenForOwner: false,
                     pausedUntil,
                     pauseReason: 'dashboard_agent',
+                    followUpAt: null,
                     unreadCount: 0,
                     lastMessagePreview: `You: ${replyText.slice(0, 100)}`,
                     lastMessageAt: now,
@@ -1444,7 +2102,7 @@ class WhatsAppTenantManager {
                 $push: {
                     contextTurns: {
                         $each: [{ role: 'assistant', text: `[Human Agent]: ${replyText.slice(0, 600)}` }],
-                        $slice: -8
+                        $slice: -10
                     }
                 }
             }
@@ -1468,6 +2126,7 @@ class WhatsAppTenantManager {
         eventBus.emitTenant(tenantId, 'inbox_msg', {
             conversationId: conversationDoc._id,
             aiStatus: 'paused',
+            unseenForOwner: false,
             pausedUntil: pausedUntil.toISOString(),
             message: { ...doc, createdAt: now.toISOString() }
         });
@@ -1476,22 +2135,15 @@ class WhatsAppTenantManager {
     }
 
     _extractPreviewText(msg) {
-        const m = msg?.message;
-        if (!m) return '';
-        return (
-            m.conversation ||
-            m.extendedTextMessage?.text ||
-            m.imageMessage?.caption ||
-            m.videoMessage?.caption ||
-            m.documentWithCaptionMessage?.message?.documentMessage?.caption ||
-            m.buttonsResponseMessage?.selectedDisplayText ||
-            m.listResponseMessage?.title ||
-            ''
-        ).trim();
+        return this._extractNormalizedPayload(msg).text;
     }
 
     async shutdownAll() {
         this.isShuttingDown = true;
+        if (this.sweeperTimer) {
+            clearInterval(this.sweeperTimer);
+            this.sweeperTimer = null;
+        }
         const tasks = [];
         for (const tenantId of this.runtimes.keys()) {
             tasks.push(this.disconnectTenant(tenantId, { preserveAuth: true, quiet: true }));
