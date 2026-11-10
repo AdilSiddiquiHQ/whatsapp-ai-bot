@@ -405,6 +405,7 @@ class TenantRuntime {
         this.currentQRDataUrl = null;
         this.pairingCode = null;
         this.reconnectAttempts = 0;
+        this.deployOverlapRetries = 0;
         this.reconnectTimer = null;
         this.isStopping = false;
         this.isShuttingDownSocket = false;
@@ -532,9 +533,10 @@ class WhatsAppTenantManager {
             if (hasCreds) toBoot.push(t._id);
         }
 
-        console.log(`[Manager] Booting ${toBoot.length} saved WhatsApp sessions sequentially (cap=${CONFIG.MAX_ACTIVE_WA_SESSIONS}).`);
-        // Sequential staggered boot prevents 0.1 vCPU overload & 515/429 thundering herd on Render Free
+        console.log(`[Manager] Booting ${toBoot.length} saved WhatsApp sessions in ~5s after deploy handoff (cap=${CONFIG.MAX_ACTIVE_WA_SESSIONS}).`);
+        // Wait 5s so zero-downtime deploy old container receives SIGTERM & closes its WhatsApp WebSocket cleanly first (prevents 440 & Bad MAC races!)
         (async () => {
+            await HumanMath.sleep(5000);
             for (let i = 0; i < toBoot.length; i++) {
                 if (this.isShuttingDown) break;
                 await this.connectTenant(toBoot[i]).catch(() => {});
@@ -682,6 +684,7 @@ class WhatsAppTenantManager {
                     rt.currentQRDataUrl = null;
                     rt.pairingCode = null;
                     rt.reconnectAttempts = 0;
+                    rt.deployOverlapRetries = 0;
                     rt.notifyPairingReady();
 
                     const meId = sock.user?.id || '';
@@ -726,12 +729,7 @@ class WhatsAppTenantManager {
                         return;
                     }
 
-                    if (
-                        statusCode === 401 ||
-                        statusCode === DisconnectReason.loggedOut ||
-                        statusCode === 500 ||
-                        statusCode === DisconnectReason.badSession
-                    ) {
+                    if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
                         rt.status = 'disconnected';
                         await cols.waAuth.deleteMany({ tenantId }).catch(() => {});
                         await cols.tenants.updateOne(
@@ -739,7 +737,7 @@ class WhatsAppTenantManager {
                             { $set: { waStatus: 'disconnected', waPhone: '', updatedAt: new Date() } }
                         ).catch(() => {});
                         eventBus.emitTenant(tenantId, 'wa_status', this.getStatusSnapshot(tenantId));
-                        await this.logAndEmit(tenantId, 'warn', 'wa', `Session unlinked or invalidated (code ${statusCode}). Ready for fresh QR scan.`);
+                        await this.logAndEmit(tenantId, 'warn', 'wa', `Session logged out from WhatsApp phone (code ${statusCode}). Scan QR to re-link.`);
                         return;
                     }
 
@@ -756,9 +754,18 @@ class WhatsAppTenantManager {
                     }
 
                     if (statusCode === 440 || statusCode === DisconnectReason.connectionReplaced) {
+                        const isBootOverlap = (Date.now() - rt.bootTimeMs < 60_000) && rt.deployOverlapRetries < 2;
+                        if (isBootOverlap) {
+                            rt.deployOverlapRetries++;
+                            rt.status = 'connecting';
+                            eventBus.emitTenant(tenantId, 'wa_status', this.getStatusSnapshot(tenantId));
+                            await this.logAndEmit(tenantId, 'warn', 'wa', `Deploy handoff overlap (440). Reconnecting cleanly in 7s...`);
+                            rt.reconnectTimer = setTimeout(() => this.connectTenant(tenantId, { forceFresh: true }).catch(() => {}), 7000);
+                            return;
+                        }
                         rt.status = 'disconnected';
                         eventBus.emitTenant(tenantId, 'wa_status', this.getStatusSnapshot(tenantId));
-                        await this.logAndEmit(tenantId, 'warn', 'wa', 'WhatsApp connection replaced by another session (440).');
+                        await this.logAndEmit(tenantId, 'warn', 'wa', 'WhatsApp connection replaced by another session (440). Click Reconnect when ready.');
                         return;
                     }
 
@@ -771,19 +778,23 @@ class WhatsAppTenantManager {
                         return;
                     }
 
+                    // Transient codes (including 500 badSession / network drops): preserve saved auth keys and retry safely!
                     if (rt.reconnectAttempts < 7) {
                         rt.reconnectAttempts++;
                         rt.status = 'connecting';
-                        const backoff = Math.min(60_000, Math.pow(2, rt.reconnectAttempts) * 1000 + Math.floor(Math.random() * 1500));
+                        const is500 = statusCode === 500 || statusCode === DisconnectReason.badSession;
+                        const backoff = is500
+                            ? Math.min(45_000, rt.reconnectAttempts * 6000)
+                            : Math.min(60_000, Math.pow(2, rt.reconnectAttempts) * 1000 + Math.floor(Math.random() * 1500));
                         eventBus.emitTenant(tenantId, 'wa_status', this.getStatusSnapshot(tenantId));
-                        await this.logAndEmit(tenantId, 'warn', 'wa', `Socket closed (${statusCode || 'network'}). Retrying in ${Math.round(backoff / 1000)}s...`);
+                        await this.logAndEmit(tenantId, 'warn', 'wa', `Socket closed (${statusCode || 'network'}). Retrying in ${Math.round(backoff / 1000)}s (session preserved)...`);
                         rt.reconnectTimer = setTimeout(() => {
                             this.connectTenant(tenantId, { forceFresh: true }).catch(() => {});
                         }, backoff);
                     } else {
                         rt.status = 'disconnected';
                         eventBus.emitTenant(tenantId, 'wa_status', this.getStatusSnapshot(tenantId));
-                        await this.logAndEmit(tenantId, 'err', 'wa', 'Max reconnect retries reached. Click Reconnect manually when ready.');
+                        await this.logAndEmit(tenantId, 'err', 'wa', 'Max reconnect retries reached. Click Reconnect in Channels when ready.');
                     }
                 }
             });
@@ -1214,6 +1225,18 @@ class WhatsAppTenantManager {
             if (!tenant || tenant.status !== 'active') return;
 
             const peer = this._resolvePeerIdentity(rt, msg);
+            if (!peer.isGroup && peer.lidJid && peer.phoneNumber === 'WhatsApp User') {
+                const knownConv = await cols.conversations.findOne(
+                    { tenantId, lidJid: peer.lidJid },
+                    { projection: { externalRef: 1, phoneNumber: 1, remoteJid: 1 } }
+                ).catch(() => null);
+                if (knownConv?.externalRef) {
+                    const pn = normalizeDigits(knownConv.externalRef);
+                    if (pn) rt.lidToPn.set(peer.lidJid, pn);
+                    peer.canonicalRef = knownConv.externalRef;
+                    peer.phoneNumber = knownConv.phoneNumber || peer.phoneNumber;
+                }
+            }
 
             // Handle live message deletions & edits mid-debounce
             if (payload.type === 'revoke') {
@@ -1240,14 +1263,20 @@ class WhatsAppTenantManager {
             const isFromMe = Boolean(msg.key.fromMe);
             const msgTsMs = (Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000;
 
-            // Catch live owner phone/web echoes on both notify and recent append reconnect windows
+            // Catch live owner phone/web echoes ONLY for genuine post-boot messages (never empty syncs or bot history!)
             if (isFromMe) {
-                const isRecent = Date.now() - msgTsMs < 120_000 && msgTsMs >= rt.bootTimeMs - 15_000;
-                if (type !== 'notify' && !isRecent) return;
+                if (type !== 'notify') return;
+                if (msgTsMs < rt.bootTimeMs - 3000) return;
                 if (rt.botSentIds.has(msg.key.id)) return;
                 if (peer.isGroup) return;
+                if (!['text', 'image', 'audio', 'location', 'contact'].includes(payload.type)) return;
 
-                const extractedText = payload.text || '[Attachment]';
+                const alreadyBotSent = msg.key.id
+                    ? await cols.messages.findOne({ tenantId, waMsgId: msg.key.id }, { projection: { _id: 1 } }).catch(() => null)
+                    : null;
+                if (alreadyBotSent) return;
+
+                const extractedText = payload.text || (payload.type === 'audio' ? '[Voice Note]' : '[Attachment]');
                 await this._handleManualOwnerEcho(tenantId, rt, tenant, peer, extractedText, msg.key.id);
                 return;
             }
