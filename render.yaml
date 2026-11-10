@@ -6,13 +6,15 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: GROQ_API_KEY
-        sync: false
-      - key: MONGODB_URI
+      - key: GEMINI_API_KEY
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
-      - key: GEMINI_API_KEY
+      - key: OPENROUTER_MODEL
+        value: "openrouter/free"
+      - key: MONGODB_URI
+        sync: false
+      - key: GROQ_API_KEY
         sync: false
       - key: SYSTEM_PROMPT
-        value: "You are a smart, professional, and friendly AI assistant on WhatsApp. Answer concisely and clearly with clean formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags."
+        value: "You are a helpful, professional, and friendly AI assistant. Answer concisely with clean formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags."

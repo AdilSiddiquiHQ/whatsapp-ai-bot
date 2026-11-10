@@ -11,6 +11,7 @@ import makeWASocket, {
     makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import { MongoClient } from 'mongodb';
+import { GoogleGenAI } from '@google/genai';
 import fs from 'fs/promises';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -22,9 +23,9 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 3000;
 
 // Configuration
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'whatsapp_bot';
 const SESSION_ID = process.env.SESSION_ID || 'default';
@@ -33,12 +34,21 @@ const BOT_API_SECRET = process.env.BOT_API_SECRET || '';
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
     'You are a helpful, professional, and friendly AI assistant. Answer concisely with clean formatting (*bold*, _italic_, bullet points, emojis). Avoid markdown hashtags.';
 
-// Active Groq models fallback chain: Flagship 120B first for maximum intelligence
-const GROQ_MODELS = [
-    'openai/gpt-oss-120b',       // Flagship 120B model (GPT-4 class intelligence, ~500 tokens/sec)
-    'openai/gpt-oss-20b',        // High-speed fallback (1000 tokens/sec)
-    'qwen/qwen3.8-27b'           // High reasoning multilingual fallback
+// Active 2026 Models (Verified against live endpoints)
+const GEMINI_MODELS = [
+    'gemini-3.8-flash',          // Smartest balanced 2026 Flash (falls back immediately if 503 busy)
+    'gemini-3.5-flash-lite',     // Ultra-fast, high-throughput, 1M context
+    'gemini-3.1-flash-lite'      // Reliable lightweight backup
 ];
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'openrouter/free';
+const GROQ_MODELS = [
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.8-27b'
+];
+
+const geminiClient = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+let lastModelUsed = GEMINI_API_KEY ? GEMINI_MODELS[0] : (OPENROUTER_API_KEY ? OPENROUTER_MODEL : GROQ_MODELS[0]);
 
 const baileysLogger = pino({ level: 'silent' });
 
@@ -394,14 +404,81 @@ async function callLLMWithFallback(sessionKey, userPrompt, channel = 'wa') {
         history.splice(1, 2);
     }
 
-    const finalize = async (rawReply) => {
+    const finalize = async (rawReply, usedModel) => {
+        if (usedModel) lastModelUsed = usedModel;
         const formatted = formatForChannel(rawReply, channel);
         history.push({ role: 'assistant', content: formatted });
         await persistChatHistory(sessionKey, history);
         return formatted;
     };
 
-    // 1. Try Groq with multi-model fallback chain
+    // 1. Try Google Gemini 2026 Models via @google/genai Interactions API
+    if (geminiClient) {
+        const stepsInput = history.slice(1).map((m) => ({
+            type: m.role === 'assistant' ? 'model_output' : 'user_input',
+            content: [{ type: 'text', text: m.content }]
+        }));
+
+        for (const modelId of GEMINI_MODELS) {
+            try {
+                const interaction = await Promise.race([
+                    geminiClient.interactions.create({
+                        model: modelId,
+                        system_instruction: SYSTEM_PROMPT,
+                        input: stepsInput,
+                        store: false,
+                        generation_config: { max_output_tokens: 800, temperature: 0.7 }
+                    }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout (10s)')), 10000))
+                ]);
+                const reply = interaction?.output_text?.trim();
+                if (reply) return await finalize(reply, modelId);
+            } catch (err) {
+                console.warn(`[Gemini Warning] Model '${modelId}' failed:`, err.status || err.message);
+                if (err.status === 401 || err.status === 403) break;
+            }
+        }
+    }
+
+    // 2. Try OpenRouter (openrouter/free auto-router)
+    if (OPENROUTER_API_KEY) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'HTTP-Referer': 'https://localhost',
+                    'X-Title': 'Omnichannel AI Bot'
+                },
+                body: JSON.stringify({
+                    model: OPENROUTER_MODEL,
+                    messages: history,
+                    max_tokens: 800,
+                    temperature: 0.7
+                }),
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+
+            if (response.ok) {
+                const data = await response.json();
+                const reply = data.choices?.[0]?.message?.content?.trim();
+                if (reply) return await finalize(reply, data.model || OPENROUTER_MODEL);
+            } else {
+                const errText = await response.text().catch(() => '');
+                console.warn(`[OpenRouter Warning] HTTP ${response.status}:`, errText.slice(0, 200));
+            }
+        } catch (e) {
+            console.error('[OpenRouter Error]:', e.message);
+        }
+    }
+
+    // 3. Optional Groq fallback
     if (GROQ_API_KEY) {
         for (const modelId of GROQ_MODELS) {
             try {
@@ -428,7 +505,7 @@ async function callLLMWithFallback(sessionKey, userPrompt, channel = 'wa') {
                 if (response.ok) {
                     const data = await response.json();
                     const reply = data.choices?.[0]?.message?.content?.trim();
-                    if (reply) return await finalize(reply);
+                    if (reply) return await finalize(reply, modelId);
                 }
 
                 const errBody = await response.json().catch(() => ({}));
@@ -437,65 +514,6 @@ async function callLLMWithFallback(sessionKey, userPrompt, channel = 'wa') {
             } catch (err) {
                 console.warn(`[Groq Catch] Model '${modelId}' failed:`, err.message);
             }
-        }
-    }
-
-    // 2. OpenRouter free tier fallback
-    if (OPENROUTER_API_KEY) {
-        try {
-            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                    'HTTP-Referer': 'https://localhost',
-                    'X-Title': 'Omnichannel AI Bot'
-                },
-                body: JSON.stringify({
-                    model: 'meta-llama/llama-3.3-70b-instruct:free',
-                    messages: history,
-                    max_tokens: 800,
-                    temperature: 0.7
-                })
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                const reply = data.choices?.[0]?.message?.content?.trim();
-                if (reply) return await finalize(reply);
-            }
-        } catch (e) {
-            console.error('[OpenRouter Error]:', e.message);
-        }
-    }
-
-    // 3. Google Gemini Flash free tier fallback
-    if (GEMINI_API_KEY) {
-        try {
-            const contents = history.slice(1).map((m) => ({
-                role: m.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: m.content }]
-            }));
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-                        contents,
-                        generationConfig: { maxOutputTokens: 800, temperature: 0.7 }
-                    })
-                }
-            );
-
-            if (response.ok) {
-                const data = await response.json();
-                const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-                if (reply) return await finalize(reply);
-            }
-        } catch (e) {
-            console.error('[Gemini Error]:', e.message);
         }
     }
 
@@ -686,7 +704,12 @@ app.get('/health', (req, res) => {
         status: 'ok',
         connected: isConnected,
         storage: authCollection ? 'mongodb' : 'local_disk',
-        activeModel: GROQ_MODELS[0],
+        activeModel: lastModelUsed,
+        providers: {
+            gemini: Boolean(geminiClient),
+            openrouter: Boolean(OPENROUTER_API_KEY),
+            groq: Boolean(GROQ_API_KEY)
+        },
         uptime: Math.floor(process.uptime()),
         timestamp: new Date().toISOString()
     });
