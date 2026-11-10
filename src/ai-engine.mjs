@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { CONFIG, GEMINI_MODELS, GROQ_MODELS } from './config.mjs';
+import { BRAIN_LIMITS, CONFIG, GEMINI_MODELS, GROQ_MODELS } from './config.mjs';
 
 const geminiClient = CONFIG.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: CONFIG.GEMINI_API_KEY }) : null;
 
@@ -11,64 +11,214 @@ export function getProviderAvailability() {
     };
 }
 
-/**
- * Compiles structured Business Brain settings into a tight, zero-hallucination system prompt.
- */
-export function buildTenantSystemPrompt(tenant, contactContext = null) {
-    const cfg = tenant?.botConfig || {};
-    const lines = [];
+function buildRawCatalogSnapshot(botConfig) {
+    const cfg = botConfig || {};
+    const parts = [];
+    const curr = cfg.currency || 'INR';
 
-    const bizName = cfg.businessName || tenant?.name || 'our business';
-    lines.push(`You are the official WhatsApp AI assistant for *${bizName}*${cfg.city ? ` (${cfg.city})` : ''}.`);
-    if (cfg.industry) lines.push(`Business focus: ${cfg.industry}.`);
-    lines.push(`Tone: ${cfg.tone || 'Warm & Professional'}. Language style: ${cfg.language || 'Auto (Match Customer)'}.`);
+    const offers = (cfg.offers || []).filter((o) => o && o.active !== false && o.title);
+    if (offers.length > 0) {
+        parts.push('ACTIVE OFFERS: ' + offers.map((o) => `${o.title} (${o.deal}${o.code ? `, code: ${o.code}` : ''})`).join('; '));
+    }
 
-    const emojiPolicy = cfg.emojiLevel === 'none'
-        ? 'Do NOT use any emojis.'
-        : cfg.emojiLevel === 'natural'
-            ? 'Use light, natural emojis sparingly where appropriate.'
-            : 'Avoid emojis or use at most 1 when genuinely appropriate.';
-    lines.push(emojiPolicy);
+    if (cfg.announcement && cfg.announcement.trim()) {
+        parts.push(`LIVE UPDATE: ${cfg.announcement.trim()}`);
+    }
 
-    lines.push('WhatsApp Formatting: Keep replies crisp, human, and concise (1-4 short lines unless answering detailed pricing questions). Use *bold* for emphasis, never markdown hashtags (#) or double asterisks (**).');
-
-    const activeProducts = (cfg.products || []).filter((p) => p && p.active !== false && p.name);
-    if (activeProducts.length > 0) {
-        lines.push('\nSERVICES & PRICING CATALOG (Quote strictly from this list, never invent prices):');
-        for (const p of activeProducts.slice(0, 30)) {
-            lines.push(`- ${p.name}: ${cfg.currency || 'INR'} ${p.price || 'Custom'}${p.note ? ` — ${p.note}` : ''}`);
-        }
+    const prods = (cfg.products || []).filter((p) => p && p.active !== false && p.name);
+    if (prods.length > 0) {
+        parts.push('CATALOG: ' + prods.map((p) => `${p.name}: ${curr} ${p.price || 'Ask'}${p.note ? ` (${p.note})` : ''}`).join(' | '));
     }
 
     const faqs = (cfg.faqs || []).filter((f) => f && f.q && f.a);
     if (faqs.length > 0) {
-        lines.push('\nFREQUENTLY ASKED QUESTIONS:');
-        for (const f of faqs.slice(0, 25)) {
-            lines.push(`Q: ${f.q}\nA: ${f.a}`);
-        }
+        parts.push('FAQS: ' + faqs.map((f) => `${f.q} -> ${f.a}`).join(' | '));
     }
 
     const rules = (cfg.customRules || []).filter(Boolean);
     if (rules.length > 0) {
-        lines.push('\nSTRICT BUSINESS RULES:');
-        for (const r of rules.slice(0, 15)) {
-            lines.push(`- ${r}`);
+        parts.push('RULES: ' + rules.join('; '));
+    }
+
+    return parts.join('\n');
+}
+
+/**
+ * Rebuilds compressed client knowledge digest cleanly from scratch whenever Business Brain is saved.
+ * Guarantees deleted/edited items vanish immediately while Admin's agencySystemPrompt stays untouched!
+ */
+export async function compileClientKnowledgeDigest(botConfig) {
+    const rawSnapshot = buildRawCatalogSnapshot(botConfig);
+    if (!rawSnapshot) {
+        return { compiledDigest: '', compressedByAi: false };
+    }
+
+    // If compact already, keep 100% lossless deterministic version with 0 API calls
+    if (rawSnapshot.length <= 1350) {
+        return { compiledDigest: rawSnapshot, compressedByAi: false };
+    }
+
+    // Large knowledge base (>1350 chars): run a single save-time compression pass via lightweight Flash Lite
+    if (geminiClient) {
+        try {
+            const prompt =
+                'Compress these active offers, prices, FAQs, and business rules into dense factual bullet lines under 1450 characters total.\n' +
+                'STRICT RULES:\n' +
+                '1. Keep EVERY number, price, currency, promo code, day/time, and exclusion 100% exact.\n' +
+                '2. Omit filler words; preserve only factual business information.\n' +
+                '3. Output ONLY the compressed facts with zero intro or outro.';
+
+            const interaction = await Promise.race([
+                geminiClient.interactions.create({
+                    model: 'gemini-3.5-flash-lite',
+                    system_instruction: prompt,
+                    input: [{ type: 'user_input', content: [{ type: 'text', text: rawSnapshot.slice(0, 8000) }] }],
+                    store: false,
+                    generation_config: { max_output_tokens: 450, temperature: 0.1 }
+                }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Digest timeout')), 10_000))
+            ]);
+            const compressed = extractInteractionText(interaction);
+            if (compressed && compressed.length > 40 && compressed.length <= BRAIN_LIMITS.maxDigestChars + 100) {
+                return {
+                    compiledDigest: compressed.slice(0, BRAIN_LIMITS.maxDigestChars),
+                    compressedByAi: true
+                };
+            }
+        } catch (err) {
+            console.warn('[Brain Digest Fallback]:', err.message);
         }
     }
 
-    if (cfg.extraInstructions && cfg.extraInstructions.trim()) {
-        lines.push(`\nADDITIONAL CONTEXT:\n${cfg.extraInstructions.trim().slice(0, 1800)}`);
+    // Deterministic clean truncation fallback
+    return {
+        compiledDigest: rawSnapshot.slice(0, BRAIN_LIMITS.maxDigestChars),
+        compressedByAi: false
+    };
+}
+
+function selectRelevantItems(queryText, items, maxCount, formatter) {
+    if (!items || !items.length) return [];
+    const tokens = String(queryText || '')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length >= 3);
+
+    if (!tokens.length) return items.slice(0, maxCount).map(formatter);
+
+    const scored = items.map((item) => {
+        const txt = formatter(item).toLowerCase();
+        let score = 0;
+        for (const tok of tokens) {
+            if (txt.includes(tok)) score += tok.length;
+        }
+        return { item, score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, maxCount).map((s) => formatter(s.item));
+}
+
+export function estimateKnowledgeBudget(tenantOrConfig) {
+    const cfg = tenantOrConfig?.botConfig || tenantOrConfig || {};
+    const digestLen = (cfg.compiledDigest || buildRawCatalogSnapshot(cfg)).length;
+    const agencyLen = (tenantOrConfig?.agencySystemPrompt || '').length;
+    const totalUsedChars = Math.min(BRAIN_LIMITS.maxTotalSystemChars, digestLen + agencyLen + 750);
+    return {
+        digestChars: digestLen,
+        maxDigestChars: BRAIN_LIMITS.maxDigestChars,
+        estimatedTokens: Math.ceil(totalUsedChars / 4),
+        maxTokens: Math.ceil(BRAIN_LIMITS.maxTotalSystemChars / 4),
+        compressedByAi: Boolean(cfg.compressedByAi),
+        counts: {
+            offers: (cfg.offers || []).length,
+            products: (cfg.products || []).length,
+            faqs: (cfg.faqs || []).length,
+            rules: (cfg.customRules || []).length
+        }
+    };
+}
+
+/**
+ * Compiles strict anti-hallucination + human WhatsApp persona + Admin System Prompt +
+ * active Offers + query-matched items + bounded Digest (keeps prompt tight <= ~850 tokens!).
+ */
+export function buildTenantSystemPrompt(tenant, contactContext = null, customerQuery = '') {
+    const cfg = tenant?.botConfig || {};
+    const bizName = cfg.businessName || tenant?.name || 'our business';
+    const industry = tenant?.industry || cfg.industry || '';
+    const curr = cfg.currency || 'INR';
+
+    const sections = [];
+
+    // 1. Admin's Custom Core System Prompt (immutable to client; fallback preserves legacy extraInstructions!)
+    const adminPrompt =
+        (tenant?.agencySystemPrompt || '').trim() ||
+        (cfg?.extraInstructions || '').trim() ||
+        `You work on the customer desk for ${bizName}${industry ? ` (${industry})` : ''}.`;
+    sections.push(`AGENCY ROLE & INSTRUCTIONS:\n${adminPrompt.slice(0, BRAIN_LIMITS.maxAgencyPromptChars)}`);
+
+    // 2. Realistic Human WhatsApp Voice & Strict Grounding Protocol
+    const emojiRule = cfg.emojiLevel === 'none'
+        ? 'Never use emojis.'
+        : cfg.emojiLevel === 'natural'
+            ? 'Use light natural emojis sparingly only if appropriate.'
+            : 'Use zero emojis (or at most 1 subtle emoji if natural).';
+
+    sections.push(
+        `HOW YOU TEXT ON WHATSAPP (CRITICAL):\n` +
+        `- Sound like a real human staff member texting from the business phone — NOT an AI chatbot.\n` +
+        `- Tone: ${cfg.tone || 'Natural & Helpful'}. Language: ${cfg.language || 'Auto (Match Customer)'}${cfg.city ? `. Location: ${cfg.city}` : ''}. ${emojiRule}\n` +
+        `- BANNED ROBOTIC PHRASES: NEVER say "Certainly!", "I'd be happy to help", "Great question!", "Feel free to reach out", "As an AI", or write numbered essay lists.\n` +
+        `- Keep messages brief (1-3 crisp lines). Answer the question first, use plain contractions ("we're", "you'll"), and *bold* only key prices/names.\n\n` +
+        `STRICT ZERO-HALLUCINATION RULE:\n` +
+        `- ONLY state facts, prices, offers, timings, links, and policies written in VERIFIED BUSINESS DATA below.\n` +
+        `- NEVER guess, invent, estimate, or use outside knowledge if a detail is missing.\n` +
+        `- If the customer asks anything NOT covered below (or asks for special discounts, custom complaints, or refunds), reply naturally in 1 short sentence like "Let me quickly check with our team and confirm back for you" and append [HANDOFF: reason="needs_team"] on a new line at the end.`
+    );
+
+    // 3. Verified Business Knowledge (strictly bounded under ~3400 chars total)
+    const knowledgeParts = [];
+
+    const activeOffers = (cfg.offers || []).filter((o) => o && o.active !== false && o.title);
+    if (activeOffers.length > 0) {
+        knowledgeParts.push('LIVE OFFERS: ' + activeOffers.map((o) => `*${o.title}*: ${o.deal}${o.code ? ` (Code: ${o.code})` : ''}`).join(' | '));
+    }
+
+    if (cfg.announcement && cfg.announcement.trim()) {
+        knowledgeParts.push(`IMPORTANT UPDATE: ${cfg.announcement.trim()}`);
+    }
+
+    const activeProds = (cfg.products || []).filter((p) => p && p.active !== false && p.name);
+    const activeFaqs = (cfg.faqs || []).filter((f) => f && f.q && f.a);
+
+    if (cfg.compiledDigest && cfg.compressedByAi) {
+        // Inject top exact query matches verbatim + compressed digest for everything else
+        const matchedProds = selectRelevantItems(customerQuery, activeProds, 6, (p) => `${p.name} (${curr} ${p.price}${p.note ? `, ${p.note}` : ''})`);
+        const matchedFaqs = selectRelevantItems(customerQuery, activeFaqs, 4, (f) => `Q: ${f.q} A: ${f.a}`);
+        if (matchedProds.length) knowledgeParts.push(`KEY MATCHED ITEMS: ${matchedProds.join(' | ')}`);
+        if (matchedFaqs.length) knowledgeParts.push(`KEY FAQS: ${matchedFaqs.join(' | ')}`);
+        knowledgeParts.push(`FULL KNOWLEDGE SUMMARY:\n${cfg.compiledDigest}`);
+    } else {
+        const snapshot = cfg.compiledDigest || buildRawCatalogSnapshot(cfg);
+        if (snapshot) knowledgeParts.push(snapshot);
+    }
+
+    if (knowledgeParts.length > 0) {
+        sections.push(`VERIFIED BUSINESS DATA (Currency: ${curr}):\n${knowledgeParts.join('\n').slice(0, 1900)}`);
+    } else {
+        sections.push('VERIFIED BUSINESS DATA: No prices or catalog items added yet. If asked about prices/services, politely tell them you will check with the team and emit [HANDOFF: reason="empty_catalog"].');
     }
 
     if (contactContext?.displayName || contactContext?.phoneNumber) {
-        lines.push(`\nCustomer profile known: Name=${contactContext.displayName || 'Unknown'}, Phone=${contactContext.phoneNumber || 'Unknown'}. Do not redundantly ask for details already known.`);
+        sections.push(`CUSTOMER: ${contactContext.displayName || 'Customer'} (${contactContext.phoneNumber || ''}). Never ask for details already known.`);
     }
 
-    lines.push(
-        '\nINTERNAL LEAD CAPTURE TAG: If the customer reveals meaningful buying intent, a product request, booking interest, or budget, append ONE compact hidden tag at the very end on a new line: [LEAD: intent="short 3-5 word summary" | budget="amount or empty" | score="hot|warm|cold"]. Only include when relevant.'
+    sections.push(
+        `SILENT LEAD TAG: Only if the customer shows buying intent, asks price to buy, or requests booking, append on the last line: [LEAD: intent="3-5 words" | budget="amount or empty" | score="hot|warm|cold"]`
     );
 
-    return lines.join('\n');
+    return sections.join('\n\n').slice(0, BRAIN_LIMITS.maxTotalSystemChars + 1200);
 }
 
 export function formatForWhatsApp(rawText) {
@@ -78,31 +228,46 @@ export function formatForWhatsApp(rawText) {
     return text.trim();
 }
 
-export function extractAndStripLeadTag(rawText) {
-    const text = String(rawText || '');
-    const regex = /\n?\[LEAD:\s*([^\]]+)\]\s*$/i;
-    const match = text.match(regex);
-    if (!match) {
-        return { cleanText: text.trim(), leadData: null };
+export function extractAndStripTags(rawText) {
+    let cleanText = String(rawText || '');
+    let leadData = null;
+    let handoffData = null;
+
+    const leadRegex = /\n?\[LEAD:\s*([^\]]+)\]/i;
+    const leadMatch = cleanText.match(leadRegex);
+    if (leadMatch) {
+        cleanText = cleanText.replace(leadRegex, '');
+        const body = leadMatch[1];
+        const parsed = {};
+        const intentM = body.match(/intent="([^"]*)"/i) || body.match(/intent=([^|\]]*)/i);
+        const budgetM = body.match(/budget="([^"]*)"/i) || body.match(/budget=([^|\]]*)/i);
+        const scoreM = body.match(/score="?(hot|warm|cold)"?/i);
+        if (intentM?.[1]?.trim()) parsed.intent = intentM[1].trim().slice(0, 120);
+        if (budgetM?.[1]?.trim()) parsed.budget = budgetM[1].trim().slice(0, 60);
+        if (scoreM?.[1]) parsed.score = scoreM[1].toLowerCase();
+        if (Object.keys(parsed).length > 0) leadData = parsed;
     }
 
-    const cleanText = text.replace(regex, '').trim();
-    const body = match[1];
-    const leadData = {};
-
-    const intentM = body.match(/intent="([^"]*)"/i) || body.match(/intent=([^|\]]*)/i);
-    const budgetM = body.match(/budget="([^"]*)"/i) || body.match(/budget=([^|\]]*)/i);
-    const scoreM = body.match(/score="?(hot|warm|cold)"?/i);
-
-    if (intentM?.[1]?.trim()) leadData.intent = intentM[1].trim().slice(0, 120);
-    if (budgetM?.[1]?.trim()) leadData.budget = budgetM[1].trim().slice(0, 60);
-    if (scoreM?.[1]) leadData.score = scoreM[1].toLowerCase();
+    const handoffRegex = /\n?\[HANDOFF(?::\s*([^\]]+))?\]/i;
+    const handoffMatch = cleanText.match(handoffRegex);
+    if (handoffMatch) {
+        cleanText = cleanText.replace(handoffRegex, '');
+        const body = handoffMatch[1] || '';
+        const reasonM = body.match(/reason="([^"]*)"/i) || body.match(/reason=([^|\]]*)/i);
+        handoffData = {
+            reason: (reasonM?.[1] || 'needs_team').trim().slice(0, 80)
+        };
+    }
 
     return {
-        cleanText,
-        leadData: Object.keys(leadData).length > 0 ? leadData : null
+        cleanText: cleanText.trim(),
+        leadData,
+        handoffData
     };
 }
+
+// Keep alias export for backwards test compatibility if needed
+export const extractAndStripLeadTag = extractAndStripTags;
 
 function extractInteractionText(interaction) {
     if (interaction?.output_text && typeof interaction.output_text === 'string') {
@@ -119,26 +284,48 @@ function extractInteractionText(interaction) {
 }
 
 /**
- * Generates an AI reply with 3-tier free/fast fallback (Gemini 2026 -> OpenRouter Free -> Groq).
- * Supports ephemeral multimodal Audio (voice notes) & Image attachments without persisting media bytes.
+ * Generates an AI reply with 3-tier fallback (Gemini 2026 -> OpenRouter Free -> Groq)
+ * at low temperature (0.45) to keep replies realistic & strictly grounded.
  */
 export async function generateAIReply({
     systemPrompt,
     contextTurns = [],
     userText,
-    mediaAttachment = null // { type: 'audio'|'image', data: base64, mimeType }
+    mediaAttachment = null,
+    aiConfig = null
 }) {
     const startedAt = Date.now();
     const safeUserText = (userText || '').trim().slice(0, 2000) || (mediaAttachment?.type === 'audio' ? '[Customer sent a voice message]' : '[Customer sent an image]');
+    const temp = Number.isFinite(Number(aiConfig?.temperature))
+        ? Math.min(0.75, Math.max(0.1, Number(aiConfig.temperature)))
+        : 0.42;
+    const maxTokens = Number.isFinite(Number(aiConfig?.maxOutputTokens))
+        ? Math.min(750, Math.max(180, Number(aiConfig.maxOutputTokens)))
+        : 460;
+    const preferred = String(aiConfig?.primaryModel || 'auto');
 
-    // Trim context turns strictly to last 8 turns to limit token usage & latency
+    const orderedGeminiModels = GEMINI_MODELS.includes(preferred)
+        ? [preferred, ...GEMINI_MODELS.filter((m) => m !== preferred)]
+        : GEMINI_MODELS;
+
     const recentTurns = contextTurns.slice(-8).map((t) => ({
         role: t.role === 'assistant' ? 'assistant' : 'user',
         text: String(t.text || '').slice(0, 700)
     }));
 
-    // 1. Primary: Google Gemini 2026 Models via @google/genai Interactions API (supports native audio + image!)
-    if (geminiClient) {
+    const finalize = (raw, model) => {
+        const { cleanText, leadData, handoffData } = extractAndStripTags(raw);
+        return {
+            text: formatForWhatsApp(cleanText),
+            model,
+            latencyMs: Date.now() - startedAt,
+            leadData,
+            handoffData
+        };
+    };
+
+    // 1. Primary: Google Gemini 2026 Models via Interactions API (unless explicitly pinned to OpenRouter)
+    if (geminiClient && preferred !== 'openrouter') {
         const steps = recentTurns.map((t) => ({
             type: t.role === 'assistant' ? 'model_output' : 'user_input',
             content: [{ type: 'text', text: t.text }]
@@ -147,22 +334,14 @@ export async function generateAIReply({
         const currentParts = [{ type: 'text', text: safeUserText }];
         if (mediaAttachment?.data && mediaAttachment?.mimeType) {
             if (mediaAttachment.type === 'audio') {
-                currentParts.push({
-                    type: 'audio',
-                    data: mediaAttachment.data,
-                    mime_type: mediaAttachment.mimeType
-                });
+                currentParts.push({ type: 'audio', data: mediaAttachment.data, mime_type: mediaAttachment.mimeType });
             } else if (mediaAttachment.type === 'image') {
-                currentParts.push({
-                    type: 'image',
-                    data: mediaAttachment.data,
-                    mime_type: mediaAttachment.mimeType
-                });
+                currentParts.push({ type: 'image', data: mediaAttachment.data, mime_type: mediaAttachment.mimeType });
             }
         }
         steps.push({ type: 'user_input', content: currentParts });
 
-        for (const modelId of GEMINI_MODELS) {
+        for (const modelId of orderedGeminiModels) {
             try {
                 const interaction = await Promise.race([
                     geminiClient.interactions.create({
@@ -170,20 +349,12 @@ export async function generateAIReply({
                         system_instruction: systemPrompt,
                         input: steps,
                         store: false,
-                        generation_config: { max_output_tokens: 650, temperature: 0.65 }
+                        generation_config: { max_output_tokens: maxTokens, temperature: temp }
                     }),
                     new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout (12s)')), 12_000))
                 ]);
                 const raw = extractInteractionText(interaction);
-                if (raw) {
-                    const { cleanText, leadData } = extractAndStripLeadTag(raw);
-                    return {
-                        text: formatForWhatsApp(cleanText),
-                        model: modelId,
-                        latencyMs: Date.now() - startedAt,
-                        leadData
-                    };
-                }
+                if (raw) return finalize(raw, modelId);
             } catch (err) {
                 console.warn(`[AI Engine] Gemini '${modelId}' fallback:`, err.status || err.message);
                 if (err.status === 401 || err.status === 403) break;
@@ -191,11 +362,10 @@ export async function generateAIReply({
         }
     }
 
-    // Text-only fallback prompt if customer sent uncaptioned media when Gemini is unavailable
     const fallbackUserText = mediaAttachment && !userText?.trim()
         ? (mediaAttachment.type === 'audio'
-            ? '[The customer sent a voice note that could not be transcribed right now. Politely ask them to share their message in text so you can help right away.]'
-            : '[The customer sent an image without caption that could not be inspected right now. Politely ask what details or item they would like help with.]')
+            ? '[Customer sent a voice note. Ask them briefly to type their message so you can help right away.]'
+            : '[Customer sent a photo without caption. Ask briefly what item or detail they need help with.]')
         : safeUserText;
 
     const chatMessages = [
@@ -220,8 +390,8 @@ export async function generateAIReply({
                 body: JSON.stringify({
                     model: CONFIG.OPENROUTER_MODEL,
                     messages: chatMessages,
-                    max_tokens: 650,
-                    temperature: 0.65
+                    max_tokens: maxTokens,
+                    temperature: temp
                 }),
                 signal: controller.signal
             });
@@ -230,15 +400,7 @@ export async function generateAIReply({
             if (resp.ok) {
                 const data = await resp.json();
                 const raw = data?.choices?.[0]?.message?.content?.trim();
-                if (raw) {
-                    const { cleanText, leadData } = extractAndStripLeadTag(raw);
-                    return {
-                        text: formatForWhatsApp(cleanText),
-                        model: data.model || CONFIG.OPENROUTER_MODEL,
-                        latencyMs: Date.now() - startedAt,
-                        leadData
-                    };
-                }
+                if (raw) return finalize(raw, data.model || CONFIG.OPENROUTER_MODEL);
             }
         } catch (err) {
             console.warn('[AI Engine] OpenRouter fallback error:', err.message);
@@ -260,8 +422,8 @@ export async function generateAIReply({
                     body: JSON.stringify({
                         model: modelId,
                         messages: chatMessages,
-                        max_tokens: 650,
-                        temperature: 0.65
+                        max_tokens: maxTokens,
+                        temperature: temp
                     }),
                     signal: controller.signal
                 });
@@ -270,15 +432,7 @@ export async function generateAIReply({
                 if (resp.ok) {
                     const data = await resp.json();
                     const raw = data?.choices?.[0]?.message?.content?.trim();
-                    if (raw) {
-                        const { cleanText, leadData } = extractAndStripLeadTag(raw);
-                        return {
-                            text: formatForWhatsApp(cleanText),
-                            model: modelId,
-                            latencyMs: Date.now() - startedAt,
-                            leadData
-                        };
-                    }
+                    if (raw) return finalize(raw, modelId);
                 }
                 if (resp.status === 401) break;
             } catch {}
@@ -286,10 +440,11 @@ export async function generateAIReply({
     }
 
     return {
-        text: 'Thanks for reaching out. Our assistant is momentarily busy — please send your question again in a moment or wait for our team.',
-        model: 'fallback-static',
+        text: 'Let me check with our team and get back to you shortly.',
+        model: 'fallback-handoff',
         latencyMs: Date.now() - startedAt,
         leadData: null,
+        handoffData: { reason: 'provider_unavailable' },
         isError: true
     };
 }

@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
 import express from 'express';
 import { ObjectId } from 'mongodb';
-import { CONFIG, WARMUP_PRESETS, createDefaultTenantConfig } from './config.mjs';
+import {
+    ADMIN_PROMPT_TEMPLATES,
+    BRAIN_LIMITS,
+    CONFIG,
+    WARMUP_PRESETS,
+    createDefaultTenantConfig
+} from './config.mjs';
 import {
     cols,
     isDbConnected,
@@ -30,7 +36,13 @@ import {
     csrfOriginGuard
 } from './security.mjs';
 import { eventBus } from './stream.mjs';
-import { buildTenantSystemPrompt, generateAIReply, getProviderAvailability } from './ai-engine.mjs';
+import {
+    buildTenantSystemPrompt,
+    compileClientKnowledgeDigest,
+    estimateKnowledgeBudget,
+    generateAIReply,
+    getProviderAvailability
+} from './ai-engine.mjs';
 import { waManager, normalizeDigits, formatPhoneDisplay } from './whatsapp-manager.mjs';
 
 export function createApiRouter() {
@@ -232,8 +244,10 @@ export function createApiRouter() {
                 tenantId: scope.tenantId,
                 role: scope.role,
                 impersonating: scope.impersonating,
-                onboardingDone: scope.onboardingDone || snap.status === 'open',
+                onboardingDone: Boolean(scope.onboardingDone || snap.status === 'open' || scope.tenant.waStatus === 'open'),
+                allowClientBrainEdit: scope.tenant.aiConfig?.allowClientBrainEdit !== false,
                 businessName: scope.tenant.botConfig?.businessName || scope.tenant.name,
+                industry: scope.tenant.industry || scope.tenant.botConfig?.industry || '',
                 waPhone: scope.tenant.waPhone || '',
                 waPushName: scope.tenant.waPushName || '',
                 waStatus: snap.status,
@@ -271,7 +285,12 @@ export function createApiRouter() {
     });
 
     router.post('/api/onboarding/complete', requireClient, async (req, res) => {
-        if (!req.scope.impersonating) {
+        const snap = waManager.getStatusSnapshot(req.scope.tenantId);
+        const linked = snap.status === 'open' || req.scope.tenant.waStatus === 'open';
+        if (!linked && !req.scope.impersonating) {
+            return res.status(403).json({ error: 'Link WhatsApp first before entering your workspace.' });
+        }
+        if (!req.scope.impersonating && linked) {
             await cols.users.updateOne({ _id: req.scope.userId }, { $set: { onboardingDone: true } });
             authStateCache.del(`u:${req.scope.userId}`);
         }
@@ -312,7 +331,7 @@ export function createApiRouter() {
     });
 
     router.get('/api/admin/overview', requireDb, requireAdmin, async (req, res) => {
-        const [tenants, users, statsRows, leadCounts, dbStats] = await Promise.all([
+        const [tenants, users, statsRows, leadCounts, handoffCounts, recentAlerts, dbStats] = await Promise.all([
             cols.tenants.find({}).sort({ createdAt: -1 }).toArray(),
             cols.users.find({}, { projection: { passwordHash: 0 } }).toArray(),
             cols.analyticsDaily.aggregate([
@@ -321,36 +340,61 @@ export function createApiRouter() {
             cols.leads.aggregate([
                 { $group: { _id: '$tenantId', count: { $sum: 1 } } }
             ]).toArray(),
+            cols.conversations.aggregate([
+                { $match: { isSandbox: false, aiStatus: 'human_needed' } },
+                { $group: { _id: '$tenantId', count: { $sum: 1 } } }
+            ]).toArray(),
+            cols.activityLogs
+                .find({ level: { $in: ['warn', 'err'] } })
+                .sort({ createdAt: -1 })
+                .limit(25)
+                .toArray(),
             getStorageTelemetry()
         ]);
 
         const userByTenant = new Map(users.map((u) => [u.tenantId, u]));
         const statsByTenant = new Map(statsRows.map((s) => [s._id, s]));
         const leadsByTenant = new Map(leadCounts.map((l) => [l._id, l.count]));
+        const handoffByTenant = new Map(handoffCounts.map((h) => [h._id, h.count]));
 
         const mem = process.memoryUsage();
         const clientList = tenants.map((t) => {
             const u = userByTenant.get(t._id);
             const st = statsByTenant.get(t._id);
             const rtSnap = waManager.getStatusSnapshot(t._id);
+            const budget = estimateKnowledgeBudget(t);
             return {
                 id: t._id,
                 name: t.name,
+                industry: t.industry || t.botConfig?.industry || 'Service & Retail Business',
+                agencySystemPrompt: t.agencySystemPrompt || t.botConfig?.extraInstructions || '',
+                aiConfig: t.aiConfig || { primaryModel: 'auto', temperature: 0.42, maxOutputTokens: 460, allowClientBrainEdit: true },
+                safety: {
+                    aiEnabled: t.safety?.aiEnabled !== false,
+                    warmupTier: t.safety?.warmupTier || 'warming',
+                    maxDailyOut: t.safety?.maxDailyOut || 90,
+                    maxHourlyOut: t.safety?.maxHourlyOut || 18,
+                    voiceNotesEnabled: t.safety?.voiceNotesEnabled !== false,
+                    imageVisionEnabled: t.safety?.imageVisionEnabled !== false
+                },
                 username: u?.username || '',
+                onboardingDone: Boolean(u?.onboardingDone || rtSnap.status === 'open'),
                 status: t.status,
                 waStatus: rtSnap.status,
+                circuitReason: rtSnap.circuitReason || '',
                 waPhone: t.waPhone || '',
                 waPushName: t.waPushName || '',
-                aiEnabled: Boolean(t.safety?.aiEnabled),
-                warmupTier: t.safety?.warmupTier || 'warming',
-                maxDailyOut: t.safety?.maxDailyOut || 90,
                 msgsIn: st?.msgsIn || 0,
                 msgsAiOut: st?.msgsOut || 0,
                 leadsCount: leadsByTenant.get(t._id) || 0,
+                needsHumanCount: handoffByTenant.get(t._id) || 0,
+                digestTokens: budget.estimatedTokens,
                 lastLoginAt: u?.lastLoginAt || null,
                 createdAt: t.createdAt
             };
         });
+
+        const tenantNameById = new Map(tenants.map((t) => [t._id, t.name]));
 
         res.json({
             system: {
@@ -363,6 +407,11 @@ export function createApiRouter() {
                 dbStorage: dbStats,
                 uptimeSec: Math.floor(process.uptime())
             },
+            promptTemplates: ADMIN_PROMPT_TEMPLATES,
+            systemAlerts: recentAlerts.map((a) => ({
+                ...a,
+                tenantName: tenantNameById.get(a.tenantId) || a.tenantId
+            })),
             tenants: clientList
         });
     });
@@ -372,6 +421,10 @@ export function createApiRouter() {
         const usernameNormalized = normalizeUsername(usernameRaw);
         const password = String(req.body?.password || '');
         const businessName = String(req.body?.businessName || usernameRaw).trim().slice(0, 80);
+        const industry = String(req.body?.industry || 'Service & Retail Business').trim().slice(0, 80);
+        const agencySystemPrompt = String(req.body?.agencySystemPrompt || req.body?.systemPrompt || '').trim();
+        const cloneFromTenantId = String(req.body?.cloneFromTenantId || '').trim();
+        const primaryModel = String(req.body?.primaryModel || 'auto');
 
         if (!isValidUsername(usernameNormalized)) {
             return res.status(400).json({ error: 'Username must be 3-32 chars (a-z, 0-9, dot, underscore, hyphen).' });
@@ -388,7 +441,32 @@ export function createApiRouter() {
         const tenantId = `t_${crypto.randomBytes(6).toString('hex')}`;
         const userId = `u_${crypto.randomBytes(6).toString('hex')}`;
         const now = new Date();
-        const defaults = createDefaultTenantConfig(businessName);
+        let defaults = createDefaultTenantConfig(businessName, {
+            industry,
+            agencySystemPrompt,
+            aiConfig: { primaryModel }
+        });
+
+        // Optional: clone prompt, catalog, FAQs & safety presets from an existing client (zero chat/lead/auth copy!)
+        if (cloneFromTenantId) {
+            const src = await cols.tenants.findOne({ _id: cloneFromTenantId });
+            if (src) {
+                defaults.industry = industry || src.industry || defaults.industry;
+                defaults.agencySystemPrompt = agencySystemPrompt || src.agencySystemPrompt || defaults.agencySystemPrompt;
+                defaults.aiConfig = { ...(src.aiConfig || defaults.aiConfig), primaryModel: primaryModel || src.aiConfig?.primaryModel || 'auto' };
+                defaults.botConfig = {
+                    ...defaults.botConfig,
+                    ...(src.botConfig || {}),
+                    businessName
+                };
+                defaults.safety = { ...(src.safety || defaults.safety) };
+                defaults.quickReplies = Array.isArray(src.quickReplies) ? [...src.quickReplies] : defaults.quickReplies;
+            }
+        }
+
+        if (req.body?.maxDailyOut !== undefined) {
+            defaults.safety.maxDailyOut = Math.max(5, Math.min(1000, Number(req.body.maxDailyOut) || 90));
+        }
 
         const tenantDoc = {
             _id: tenantId,
@@ -439,14 +517,49 @@ export function createApiRouter() {
         if (req.body?.status === 'active' || req.body?.status === 'suspended') {
             updates.status = req.body.status;
         }
-        if (req.body?.maxDailyOut !== undefined) {
-            updates['safety.maxDailyOut'] = Math.max(5, Math.min(1000, Number(req.body.maxDailyOut) || 90));
+        if (typeof req.body?.businessName === 'string' && req.body.businessName.trim()) {
+            const nextName = req.body.businessName.trim().slice(0, 80);
+            updates.name = nextName;
+            updates['botConfig.businessName'] = nextName;
         }
-        if (req.body?.businessName) {
-            updates.name = String(req.body.businessName).trim().slice(0, 80);
+        if (typeof req.body?.industry === 'string') {
+            updates.industry = req.body.industry.trim().slice(0, 80);
+        }
+        if (typeof req.body?.agencySystemPrompt === 'string') {
+            updates.agencySystemPrompt = req.body.agencySystemPrompt.trim().slice(0, BRAIN_LIMITS.maxAgencyPromptChars);
         }
 
+        const aiCfg = req.body?.aiConfig;
+        if (aiCfg && typeof aiCfg === 'object') {
+            if (typeof aiCfg.primaryModel === 'string') updates['aiConfig.primaryModel'] = aiCfg.primaryModel.slice(0, 60);
+            if (aiCfg.temperature !== undefined) {
+                updates['aiConfig.temperature'] = Math.min(0.75, Math.max(0.1, Number(aiCfg.temperature) || 0.42));
+            }
+            if (aiCfg.maxOutputTokens !== undefined) {
+                updates['aiConfig.maxOutputTokens'] = Math.min(750, Math.max(180, Number(aiCfg.maxOutputTokens) || 460));
+            }
+            if (aiCfg.allowClientBrainEdit !== undefined) {
+                updates['aiConfig.allowClientBrainEdit'] = Boolean(aiCfg.allowClientBrainEdit);
+            }
+        }
+
+        const saf = req.body?.safety || {};
+        const maxDailyRaw = req.body?.maxDailyOut ?? saf.maxDailyOut;
+        if (maxDailyRaw !== undefined) {
+            updates['safety.maxDailyOut'] = Math.max(5, Math.min(1000, Number(maxDailyRaw) || 90));
+        }
+        if (saf.maxHourlyOut !== undefined) {
+            updates['safety.maxHourlyOut'] = Math.max(2, Math.min(100, Number(saf.maxHourlyOut) || 18));
+        }
+        if (saf.aiEnabled !== undefined) updates['safety.aiEnabled'] = Boolean(saf.aiEnabled);
+        if (saf.voiceNotesEnabled !== undefined) updates['safety.voiceNotesEnabled'] = Boolean(saf.voiceNotesEnabled);
+        if (saf.imageVisionEnabled !== undefined) updates['safety.imageVisionEnabled'] = Boolean(saf.imageVisionEnabled);
+
         await cols.tenants.updateOne({ _id: tenantId }, { $set: updates });
+
+        if (typeof req.body?.onboardingDone === 'boolean') {
+            await cols.users.updateMany({ tenantId }, { $set: { onboardingDone: req.body.onboardingDone } });
+        }
 
         // Evict auth cache for this tenant's users immediately
         const tenantUsers = await cols.users.find({ tenantId }).toArray();
@@ -456,7 +569,67 @@ export function createApiRouter() {
             await waManager.disconnectTenant(tenantId, { preserveAuth: true, quiet: true });
         }
 
+        if (req.body?.clearCircuitBreaker) {
+            const rt = waManager.getRuntime(tenantId);
+            rt.circuitBreakerUntil = 0;
+            rt.circuitReason = '';
+            if (rt.sock) rt.status = 'open';
+            eventBus.emitTenant(tenantId, 'wa_status', waManager.getStatusSnapshot(tenantId));
+        }
+
         res.json({ ok: true });
+    });
+
+    router.post('/api/admin/tenants/:id/wa', requireDb, requireAdmin, async (req, res) => {
+        const tenantId = req.params.id;
+        const action = String(req.body?.action || '');
+        try {
+            if (action === 'connect') {
+                await waManager.connectTenant(tenantId, { forceFresh: true });
+            } else if (action === 'disconnect') {
+                await waManager.disconnectTenant(tenantId, { preserveAuth: true });
+            } else if (action === 'unlink') {
+                await waManager.disconnectTenant(tenantId, { preserveAuth: false });
+            } else {
+                return res.status(400).json({ error: 'Invalid WA action.' });
+            }
+            res.json({ ok: true, status: waManager.getStatusSnapshot(tenantId) });
+        } catch (err) {
+            res.status(400).json({ error: err.message });
+        }
+    });
+
+    router.post('/api/admin/tenants/:id/test-prompt', requireDb, requireAdmin, async (req, res) => {
+        const tenant = await cols.tenants.findOne({ _id: req.params.id });
+        if (!tenant) return res.status(404).json({ error: 'Client not found.' });
+
+        const text = String(req.body?.text || '').trim();
+        if (!text) return res.status(400).json({ error: 'Enter a test prompt message.' });
+
+        // Allow overriding prompt live before saving!
+        const draftTenant = {
+            ...tenant,
+            agencySystemPrompt: typeof req.body?.agencySystemPrompt === 'string'
+                ? req.body.agencySystemPrompt
+                : tenant.agencySystemPrompt,
+            aiConfig: req.body?.aiConfig ? { ...(tenant.aiConfig || {}), ...req.body.aiConfig } : tenant.aiConfig
+        };
+
+        const systemPrompt = buildTenantSystemPrompt(draftTenant, { displayName: 'Test Buyer', phoneNumber: '+91 90000 00000' }, text);
+        const aiRes = await generateAIReply({
+            systemPrompt,
+            contextTurns: [],
+            userText: text,
+            aiConfig: draftTenant.aiConfig
+        });
+
+        res.json({
+            reply: aiRes.text,
+            model: aiRes.model,
+            latencyMs: aiRes.latencyMs,
+            handoffData: aiRes.handoffData,
+            promptChars: systemPrompt.length
+        });
     });
 
     router.post('/api/admin/tenants/:id/reset-password', requireDb, requireAdmin, async (req, res) => {
@@ -611,6 +784,8 @@ export function createApiRouter() {
         const now = new Date();
         if (filter === 'paused') {
             query.pausedUntil = { $gt: now };
+        } else if (filter === 'human_needed') {
+            query.aiStatus = 'human_needed';
         } else if (filter === 'active') {
             query.$and = [{ optedOut: { $ne: true } }, { $or: [{ pausedUntil: null }, { pausedUntil: { $lte: now } }] }];
         } else if (filter === 'opted_out') {
@@ -743,11 +918,16 @@ export function createApiRouter() {
         const existing = await cols.conversations.findOne({ _id: convId });
         const contextTurns = existing?.contextTurns || [];
 
-        const systemPrompt = buildTenantSystemPrompt(tenant, { displayName: 'Preview Customer', phoneNumber: '+91 90000 00000' });
+        const systemPrompt = buildTenantSystemPrompt(
+            tenant,
+            { displayName: 'Preview Customer', phoneNumber: '+91 90000 00000' },
+            text
+        );
         const aiRes = await generateAIReply({
             systemPrompt,
             contextTurns,
-            userText: text
+            userText: text,
+            aiConfig: tenant.aiConfig
         });
 
         const now = new Date();
@@ -783,7 +963,8 @@ export function createApiRouter() {
             reply: aiRes.text,
             model: aiRes.model,
             latencyMs: aiRes.latencyMs,
-            leadData: aiRes.leadData
+            leadData: aiRes.leadData,
+            handoffData: aiRes.handoffData
         });
     });
 
@@ -792,62 +973,87 @@ export function createApiRouter() {
         res.json({ ok: true });
     });
 
-    // Business Brain Config
+    // Business Brain Config (Client self-serve Offers/Catalog/FAQs/Announcements under hard token limits!)
     router.get('/api/brain', requireClient, (req, res) => {
+        const tenant = req.scope.tenant;
         res.json({
-            botConfig: req.scope.tenant.botConfig,
-            quickReplies: req.scope.tenant.quickReplies || []
+            botConfig: tenant.botConfig,
+            quickReplies: tenant.quickReplies || [],
+            industry: tenant.industry || tenant.botConfig?.industry || 'Service & Retail Business',
+            allowClientBrainEdit: tenant.aiConfig?.allowClientBrainEdit !== false,
+            limits: BRAIN_LIMITS,
+            budget: estimateKnowledgeBudget(tenant)
         });
     });
 
     router.put('/api/brain', requireClient, async (req, res) => {
         const tenantId = req.scope.tenantId;
+        const tenant = req.scope.tenant;
+        if (tenant.aiConfig?.allowClientBrainEdit === false && !req.scope.impersonating) {
+            return res.status(403).json({ error: 'Knowledge editing is managed by your agency administrator.' });
+        }
+
         const incoming = req.body?.botConfig || {};
         const quickReplies = Array.isArray(req.body?.quickReplies)
             ? req.body.quickReplies
                 .filter((q) => q && q.title && q.body)
-                .slice(0, 20)
+                .slice(0, BRAIN_LIMITS.maxQuickReplies)
                 .map((q, idx) => ({
                     id: String(q.id || `qr_${idx}`),
                     title: String(q.title).trim().slice(0, 40),
-                    body: String(q.body).trim().slice(0, 500)
+                    body: String(q.body).trim().slice(0, 400)
                 }))
-            : req.scope.tenant.quickReplies;
+            : tenant.quickReplies;
 
+        // Strictly enforce slot & character caps so client cannot bloat prompts or free API quotas
         const cleanConfig = {
-            businessName: String(incoming.businessName || req.scope.tenant.name || '').trim().slice(0, 80),
-            industry: String(incoming.industry || '').trim().slice(0, 80),
-            city: String(incoming.city || '').trim().slice(0, 60),
-            currency: String(incoming.currency || 'INR').trim().slice(0, 12),
-            language: String(incoming.language || 'Auto (Match Customer)').trim().slice(0, 40),
-            tone: String(incoming.tone || 'Warm & Professional').trim().slice(0, 40),
+            businessName: String(incoming.businessName || tenant.botConfig?.businessName || tenant.name || '').trim().slice(0, 80),
+            city: String(incoming.city ?? tenant.botConfig?.city ?? '').trim().slice(0, 60),
+            currency: String(incoming.currency || tenant.botConfig?.currency || 'INR').trim().slice(0, 12),
+            language: String(incoming.language || tenant.botConfig?.language || 'Auto (Match Customer)').trim().slice(0, 40),
+            tone: String(incoming.tone || tenant.botConfig?.tone || 'Natural & Helpful').trim().slice(0, 40),
             emojiLevel: ['none', 'minimal', 'natural'].includes(incoming.emojiLevel) ? incoming.emojiLevel : 'minimal',
+            announcement: String(incoming.announcement || '').trim().slice(0, BRAIN_LIMITS.maxAnnouncementChars),
+            offers: Array.isArray(incoming.offers)
+                ? incoming.offers.slice(0, BRAIN_LIMITS.maxOffers).map((o) => ({
+                    title: String(o.title || '').trim().slice(0, 60),
+                    deal: String(o.deal || '').trim().slice(0, 100),
+                    code: String(o.code || '').trim().slice(0, 32),
+                    active: o.active !== false
+                })).filter((o) => o.title && o.deal)
+                : [],
             products: Array.isArray(incoming.products)
-                ? incoming.products.slice(0, 35).map((p) => ({
-                    name: String(p.name || '').trim().slice(0, 80),
-                    price: String(p.price || '').trim().slice(0, 40),
-                    note: String(p.note || '').trim().slice(0, 140),
+                ? incoming.products.slice(0, BRAIN_LIMITS.maxProducts).map((p) => ({
+                    name: String(p.name || '').trim().slice(0, 70),
+                    price: String(p.price || '').trim().slice(0, 35),
+                    note: String(p.note || '').trim().slice(0, 120),
                     active: p.active !== false
                 })).filter((p) => p.name)
                 : [],
             faqs: Array.isArray(incoming.faqs)
-                ? incoming.faqs.slice(0, 30).map((f) => ({
-                    q: String(f.q || '').trim().slice(0, 180),
-                    a: String(f.a || '').trim().slice(0, 500)
+                ? incoming.faqs.slice(0, BRAIN_LIMITS.maxFaqs).map((f) => ({
+                    q: String(f.q || '').trim().slice(0, 140),
+                    a: String(f.a || '').trim().slice(0, 360)
                 })).filter((f) => f.q && f.a)
                 : [],
             customRules: Array.isArray(incoming.customRules)
-                ? incoming.customRules.map((r) => String(r).trim().slice(0, 180)).filter(Boolean).slice(0, 20)
+                ? incoming.customRules.map((r) => String(r).trim().slice(0, 140)).filter(Boolean).slice(0, BRAIN_LIMITS.maxRules)
                 : [],
             leadFields: ['name', 'intent', 'budget'],
-            extraInstructions: String(incoming.extraInstructions || '').trim().slice(0, 1800)
+            // Preserve legacy extraInstructions cleanly if an existing client had one!
+            ...(tenant.botConfig?.extraInstructions ? { extraInstructions: tenant.botConfig.extraInstructions } : {})
         };
+
+        // Recompile compressed digest from active items cleanly (edited/deleted entries vanish immediately!)
+        const { compiledDigest, compressedByAi } = await compileClientKnowledgeDigest(cleanConfig);
+        cleanConfig.compiledDigest = compiledDigest;
+        cleanConfig.compressedByAi = compressedByAi;
 
         await cols.tenants.updateOne(
             { _id: tenantId },
             {
                 $set: {
-                    name: cleanConfig.businessName || req.scope.tenant.name,
+                    name: cleanConfig.businessName || tenant.name,
                     botConfig: cleanConfig,
                     quickReplies,
                     updatedAt: new Date()
@@ -855,8 +1061,14 @@ export function createApiRouter() {
             }
         );
 
-        await waManager.logAndEmit(tenantId, 'info', 'ai', 'Updated Business Brain knowledge base & pricing catalog.');
-        res.json({ ok: true, botConfig: cleanConfig, quickReplies });
+        const budget = estimateKnowledgeBudget({ ...tenant, botConfig: cleanConfig });
+        await waManager.logAndEmit(
+            tenantId,
+            'info',
+            'ai',
+            `Saved Business Brain (${budget.counts.offers} offers, ${budget.counts.products} items, ${budget.counts.faqs} FAQs · ~${budget.estimatedTokens} prompt tokens${compressedByAi ? ', AI-compressed' : ''}).`
+        );
+        res.json({ ok: true, botConfig: cleanConfig, quickReplies, budget });
     });
 
     // Safety, Warmup Caps, Hours, Opt-outs & Blacklist

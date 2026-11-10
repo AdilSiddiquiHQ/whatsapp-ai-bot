@@ -15,6 +15,7 @@ import pino from 'pino';
 import QRCode from 'qrcode';
 import { CONFIG } from './config.mjs';
 import { BoundedCacheStore, SlidingWindowLimiter } from './cache.mjs';
+import { authStateCache } from './security.mjs';
 import {
     cols,
     addDays,
@@ -587,6 +588,11 @@ class WhatsAppTenantManager {
                             }
                         }
                     ).catch(() => {});
+
+                    // Unlock strict WhatsApp onboarding gate automatically once linked!
+                    const tUsers = await cols.users.find({ tenantId }, { projection: { _id: 1 } }).toArray().catch(() => []);
+                    await cols.users.updateMany({ tenantId }, { $set: { onboardingDone: true } }).catch(() => {});
+                    for (const u of tUsers) authStateCache.del(`u:${u._id}`);
 
                     eventBus.emitTenant(tenantId, 'wa_status', {
                         ...this.getStatusSnapshot(tenantId),
@@ -1195,16 +1201,18 @@ class WhatsAppTenantManager {
             return;
         }
 
-        const systemPrompt = buildTenantSystemPrompt(tenant, {
-            displayName: convDoc.displayName,
-            phoneNumber: convDoc.phoneNumber
-        });
+        const systemPrompt = buildTenantSystemPrompt(
+            tenant,
+            { displayName: convDoc.displayName, phoneNumber: convDoc.phoneNumber },
+            mergedText
+        );
 
         const aiRes = await generateAIReply({
             systemPrompt,
             contextTurns: convDoc.contextTurns || [],
             userText: mergedText,
-            mediaAttachment
+            mediaAttachment,
+            aiConfig: tenant.aiConfig
         });
         mediaAttachment = null; // Free RAM immediately
 
@@ -1283,6 +1291,54 @@ class WhatsAppTenantManager {
         // Capture Lead if AI spotted high-intent signal
         if (aiRes.leadData) {
             await this._upsertLead(tenantId, tenant, convDoc, aiRes.leadData, tz);
+        }
+
+        // Flag conversation for human team when AI hits unknown knowledge or escalation
+        if (aiRes.handoffData) {
+            const hNow = new Date();
+            const hMins = Number(tenant.safety?.takeoverMinutes ?? 30);
+            const hPauseUntil = hMins === 0 ? addDays(hNow, 3650) : new Date(hNow.getTime() + hMins * 60_000);
+            rt.pausedUntilCache.set(canonicalRef, { pausedAt: hNow.getTime(), pausedUntil: hPauseUntil.getTime() }, Math.max(hMins, 60) * 60_000);
+
+            await cols.conversations.updateOne(
+                { _id: convId },
+                {
+                    $set: {
+                        aiStatus: 'human_needed',
+                        pausedUntil: hPauseUntil,
+                        pauseReason: `ai_handoff:${aiRes.handoffData.reason}`
+                    }
+                }
+            ).catch(() => {});
+
+            eventBus.emitTenant(tenantId, 'inbox_msg', {
+                conversationId: convId,
+                aiStatus: 'human_needed',
+                pausedUntil: hPauseUntil.toISOString()
+            });
+
+            await this.logAndEmit(
+                tenantId,
+                'warn',
+                'takeover',
+                `AI escalated ${convDoc.displayName || peer.phoneNumber} to human team (${aiRes.handoffData.reason}).`
+            );
+
+            if (tenant.safety?.webhookUrl) {
+                fetch(tenant.safety.webhookUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        event: 'human_needed',
+                        tenantId,
+                        phone: convDoc.phoneNumber,
+                        name: convDoc.displayName,
+                        reason: aiRes.handoffData.reason,
+                        lastQuestion: mergedText,
+                        timestamp: hNow.toISOString()
+                    })
+                }).catch(() => {});
+            }
         }
     }
 

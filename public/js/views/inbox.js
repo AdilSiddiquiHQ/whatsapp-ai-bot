@@ -69,9 +69,9 @@ export function renderInboxView(container, ctx) {
               <span style="position:absolute;left:9px;top:9px;color:var(--ink-muted);">${icon('search', 'icon-sm')}</span>
             </div>
             <div class="row-gap" style="flex-wrap:wrap;">
-              ${['all', 'active', 'paused', 'opted_out'].map((f) => `
+              ${['all', 'active', 'human_needed', 'paused', 'opted_out'].map((f) => `
                 <button class="chip ${filter === f ? 'active' : ''}" data-filter="${f}">
-                  ${f === 'all' ? 'All' : f === 'active' ? 'AI Active' : f === 'paused' ? 'Paused' : 'Opted Out'}
+                  ${f === 'all' ? 'All' : f === 'active' ? 'AI Active' : f === 'human_needed' ? 'Needs Human' : f === 'paused' ? 'Paused' : 'Opted Out'}
                 </button>
               `).join('')}
             </div>
@@ -89,7 +89,7 @@ export function renderInboxView(container, ctx) {
                 <div class="thread-item ${active ? 'active' : ''}" data-conv-id="${escHtml(t._id)}">
                   <div class="row-between" style="margin-bottom:2px;">
                     <div class="row-gap" style="min-width:0;">
-                      <span class="dot ${t.optedOut ? 'dot-rose' : p ? 'dot-amber' : 'dot-emerald'}"></span>
+                      <span class="dot ${t.optedOut ? 'dot-rose' : (p || t.aiStatus === 'human_needed') ? 'dot-amber' : 'dot-emerald'}"></span>
                       <span style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(t.displayName || t.phoneNumber)}</span>
                     </div>
                     <span class="tabular muted" style="font-size:11px;">${relativeTime(t.lastMessageAt)}</span>
@@ -115,9 +115,11 @@ export function renderInboxView(container, ctx) {
                   <span class="pill pill-emerald" style="font-size:10px;">WhatsApp</span>
                   ${activeThread.optedOut
                     ? `<span class="pill pill-rose">Opted Out</span>`
-                    : paused
-                      ? `<span class="pill pill-amber">AI Paused (${pauseMinsLeft > 1000 ? 'Manual' : `${pauseMinsLeft}m`})</span>`
-                      : `<span class="pill pill-emerald">AI Active</span>`}
+                    : activeThread.aiStatus === 'human_needed'
+                      ? `<span class="pill pill-amber">Needs Human (AI Escalated)</span>`
+                      : paused
+                        ? `<span class="pill pill-amber">AI Paused (${pauseMinsLeft > 1000 ? 'Manual' : `${pauseMinsLeft}m`})</span>`
+                        : `<span class="pill pill-emerald">AI Active</span>`}
                 </div>
                 <div class="mono muted" style="font-size:11px;margin-top:2px;">${escHtml(activeThread.phoneNumber || activeThread.externalRef)}</div>
               </div>
@@ -350,7 +352,8 @@ export function renderInboxView(container, ctx) {
     paint();
     try {
       const res = await api('/api/sandbox/chat', { method: 'POST', body: { text: txt } });
-      sandboxMsgs.push({ role: 'assistant', text: res.reply, meta: `${res.model} · ${res.latencyMs}ms` });
+      const handoffTag = res.handoffData ? ` · HANDOFF TRIGGERED (${res.handoffData.reason})` : '';
+      sandboxMsgs.push({ role: 'assistant', text: res.reply, meta: `${res.model} · ${res.latencyMs}ms${handoffTag}` });
     } catch (err) {
       sandboxMsgs.push({ role: 'assistant', text: `Error: ${err.message}`, meta: 'error' });
     }
